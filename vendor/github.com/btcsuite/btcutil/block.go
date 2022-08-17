@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/aBitcoinDiamond/chaincfg/chainhash"
-	"github.com/aBitcoinDiamond/wire"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 )
 
 // OutOfRangeError describes an error due to accessing an element that is out
@@ -114,7 +114,7 @@ func (b *Block) Hash() *chainhash.Hash {
 func (b *Block) Tx(txNum int) (*Tx, error) {
 	// Ensure the requested transaction is in range.
 	numTx := uint64(len(b.msgBlock.Transactions))
-	if txNum < 0 || uint64(txNum) > numTx {
+	if txNum < 0 || uint64(txNum) >= numTx {
 		str := fmt.Sprintf("transaction index %d is out of range - max %d",
 			txNum, numTx-1)
 		return nil, OutOfRangeError(str)

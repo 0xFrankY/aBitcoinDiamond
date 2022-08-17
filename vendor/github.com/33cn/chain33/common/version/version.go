@@ -5,34 +5,36 @@
 // Package version 软件版本号
 package version
 
-const version = "6.1.0"
+//Version chain33 version
+var Version = "1.67.3"
 
-//var
+//var version key
 var (
 	WalletVerKey     = []byte("WalletVerKey")
 	BlockChainVerKey = []byte("BlockChainVerKey")
 	LocalDBMeta      = []byte("LocalDBMeta")
 	StoreDBMeta      = []byte("StoreDBMeta")
 	MavlTreeVerKey   = []byte("MavlTreeVerKey")
-	localversion     = "1.0.0"
+	localversion     = "2.0.0"
 	storeversion     = "1.0.0"
 	appversion       = "1.0.0"
 	GitCommit        string
+	BuildTime        string
 )
 
 //GetLocalDBKeyList 获取本地key列表
 func GetLocalDBKeyList() [][]byte {
 	return [][]byte{
-		WalletVerKey, BlockChainVerKey, LocalDBMeta, MavlTreeVerKey,
+		WalletVerKey, BlockChainVerKey, LocalDBMeta, StoreDBMeta, MavlTreeVerKey,
 	}
 }
 
 //GetVersion 获取版本信息
 func GetVersion() string {
 	if GitCommit != "" {
-		return version + "-" + GitCommit
+		return Version + "-" + GitCommit
 	}
-	return version
+	return Version
 }
 
 //GetLocalDBVersion 数据库版本解析
@@ -100,3 +102,9 @@ func SetAppVersion(version string) {
 
 //v5.3.0
 //hard fork for bug
+
+//v6.2.0
+//性能加速+mempool 阶梯手续费防止大区块攻击
+
+//v6.4.0
+//优化存储结构，减少存储数据量

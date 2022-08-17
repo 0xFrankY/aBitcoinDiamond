@@ -16,10 +16,9 @@ import (
 
 // TODO(wutao1): make these parameters configurable
 const (
-	RpcConnKeepAliveInterval = time.Second * 30
-	RpcConnDialTimeout       = time.Second * 3
-	RpcConnReadTimeout       = time.Second
-	RpcConnWriteTimeout      = time.Second
+	ConnDialTimeout  = time.Second * 3
+	ConnReadTimeout  = 30 * time.Second
+	ConnWriteTimeout = 10 * time.Second
 )
 
 type ConnState int
@@ -102,12 +101,12 @@ func (rc *RpcConn) TryConnect() (err error) {
 
 			// unlock for blocking call
 			d := &net.Dialer{
-				KeepAlive: RpcConnKeepAliveInterval,
-				Timeout:   RpcConnDialTimeout,
+				Timeout: ConnDialTimeout,
 			}
-			rc.conn, err = d.Dial("tcp", rc.Endpoint)
+			conn, err := d.Dial("tcp", rc.Endpoint)
 
 			rc.mu.Lock()
+			rc.conn = conn
 			if err != nil {
 				return err
 			}
@@ -159,10 +158,10 @@ func (rc *RpcConn) Write(msgBytes []byte) (err error) {
 
 // Read is not intended to be cancellable using context by outside user.
 // The only approach to cancel the operation is to close the connection.
-// The RpcConn will close its connection whenever the returned error is not nil.
 // If the current socket is not well established for reading, the operation will
 // fail and return error immediately.
-// This function is thread-safe.
+// This function is not-thread-safe, because the underlying TCP IO buffer
+// is not-thread-safe. Package users should call Read in a single goroutine.
 func (rc *RpcConn) Read(size int) (bytes []byte, err error) {
 	bytes, err = func() ([]byte, error) {
 		if rc.GetState() != ConnStateReady {
@@ -190,8 +189,8 @@ func NewRpcConn(addr string) *RpcConn {
 		Endpoint:     addr,
 		logger:       pegalog.GetLogger(),
 		cstate:       ConnStateInit,
-		readTimeout:  RpcConnReadTimeout,
-		writeTimeout: RpcConnWriteTimeout,
+		readTimeout:  ConnReadTimeout,
+		writeTimeout: ConnWriteTimeout,
 	}
 }
 

@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
 	"sync"
 	"time"
 
@@ -19,13 +18,20 @@ import (
 	"github.com/XiaoMi/pegasus-go-client/idl/replication"
 	"github.com/XiaoMi/pegasus-go-client/idl/rrdb"
 	"github.com/XiaoMi/pegasus-go-client/pegalog"
+	"github.com/XiaoMi/pegasus-go-client/pegasus/op"
 	"github.com/XiaoMi/pegasus-go-client/session"
 	"gopkg.in/tomb.v2"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
 )
 
 // KeyValue is the returned type of MultiGet and MultiGetRange.
 type KeyValue struct {
 	SortKey, Value []byte
+}
+
+// CompositeKey is a composition of HashKey and SortKey.
+type CompositeKey struct {
+	HashKey, SortKey []byte
 }
 
 // MultiGetOptions is the options for MultiGet and MultiGetRange, defaults to DefaultMultiGetOptions.
@@ -44,6 +50,10 @@ type MultiGetOptions struct {
 
 	// Query order
 	Reverse bool
+
+	// Whether to retrieve keys only, without value.
+	// Enabling this option will reduce the network load, improve the RPC latency.
+	NoValue bool
 }
 
 // DefaultMultiGetOptions defines the defaults of MultiGetOptions.
@@ -56,6 +66,7 @@ var DefaultMultiGetOptions = &MultiGetOptions{
 	},
 	MaxFetchCount: 100,
 	MaxFetchSize:  100000,
+	NoValue:       false,
 }
 
 // TableConnector is used to communicate with single Pegasus table.
@@ -112,7 +123,7 @@ type TableConnector interface {
 	MultiSet(ctx context.Context, hashKey []byte, sortKeys [][]byte, values [][]byte) error
 	MultiSetOpt(ctx context.Context, hashKey []byte, sortKeys [][]byte, values [][]byte, ttl time.Duration) error
 
-	// MultiDel deletes the multiple entries under `hashKey` all in one operation.
+	// MultiDel deletes the multiple entries under `hashKey` all atomically in one operation.
 	// `hashKey` / `sortKeys` : CAN'T be nil or empty.
 	// `sortKeys[i]` : CAN'T be nil but CAN be empty.
 	MultiDel(ctx context.Context, hashKey []byte, sortKeys [][]byte) error
@@ -149,6 +160,23 @@ type TableConnector interface {
 	// `hashKey`: CAN'T be nil or empty.
 	SortKeyCount(ctx context.Context, hashKey []byte) (int64, error)
 
+	// Atomically increment value by key from the cluster.
+	// Returns the new value.
+	// `hashKey` / `sortKeys` : CAN'T be nil or empty
+	Incr(ctx context.Context, hashKey []byte, sortKey []byte, increment int64) (int64, error)
+
+	// Gets values from a batch of CompositeKeys. Internally it distributes each key
+	// into a Get call and wait until all returned.
+	//
+	// `keys`: CAN'T be nil or empty, `hashkey` in `keys` can't be nil or empty either.
+	// The returned values are in sequence order of each key, aka `keys[i] => values[i]`.
+	// If keys[i] is not found, or the Get failed, values[i] is set nil.
+	//
+	// Returns a non-nil `err` once there's a failed Get call. It doesn't mean all calls failed.
+	//
+	// NOTE: this operation is not guaranteed to be atomic
+	BatchGet(ctx context.Context, keys []CompositeKey) (values [][]byte, err error)
+
 	Close() error
 }
 
@@ -183,6 +211,12 @@ func ConnectTable(ctx context.Context, tableName string, meta *session.MetaManag
 		logger:       pegalog.GetLogger(),
 	}
 
+	// if the session became unresponsive, TableConnector auto-triggers
+	// a update of the routing table.
+	p.replica.SetUnresponsiveHandler(func(n session.NodeSession) {
+		p.tryConfUpdate(errors.New("session unresponsive for long"), n)
+	})
+
 	if err := p.updateConf(ctx); err != nil {
 		return nil, err
 	}
@@ -203,11 +237,15 @@ func (p *pegasusTableConnector) updateConf(ctx context.Context) error {
 	return nil
 }
 
+func isPartitionValid(oldCount int, respCount int) bool {
+	return oldCount == 0 || oldCount == respCount || oldCount*2 == respCount || oldCount == respCount*2
+}
+
 func (p *pegasusTableConnector) handleQueryConfigResp(resp *replication.QueryCfgResponse) error {
 	if resp.Err.Errno != base.ERR_OK.String() {
 		return errors.New(resp.Err.Errno)
 	}
-	if resp.PartitionCount == 0 || len(resp.Partitions) != int(resp.PartitionCount) {
+	if resp.PartitionCount == 0 || len(resp.Partitions) != int(resp.PartitionCount) || !isPartitionValid(len(p.parts), int(resp.PartitionCount)) {
 		return fmt.Errorf("invalid table configuration: response [%v]", resp)
 	}
 
@@ -216,22 +254,30 @@ func (p *pegasusTableConnector) handleQueryConfigResp(resp *replication.QueryCfg
 
 	p.appID = resp.AppID
 
-	if len(resp.Partitions) > len(p.parts) {
-		// during partition split or first configuration update of client.
-		for _, part := range p.parts {
-			part.session.Close()
-		}
+	if len(resp.Partitions) != len(p.parts) {
+		p.logger.Printf("table[%s] partition count update from %d to %d", p.tableName, len(p.parts), len(resp.Partitions))
 		p.parts = make([]*replicaNode, len(resp.Partitions))
 	}
 
 	// TODO(wutao1): make sure PartitionIndex are continuous
 	for _, pconf := range resp.Partitions {
-		if pconf == nil || pconf.Primary == nil || pconf.Primary.GetRawAddress() == 0 {
+		if pconf == nil || (pconf.Ballot >= 0 && (pconf.Primary == nil || pconf.Primary.GetRawAddress() == 0)) {
 			return fmt.Errorf("unable to resolve routing table [appid: %d]: [%v]", p.appID, pconf)
 		}
+
+		var s *session.ReplicaSession
+		if pconf.Ballot >= 0 {
+			s = p.replica.GetReplica(pconf.Primary.GetAddress())
+		} else {
+			// table is partition split, and child partition is not ready
+			// child requests should be redirected to its parent partition
+			// this will be happened when query meta is called during partition split
+			s = nil
+		}
+
 		r := &replicaNode{
 			pconf:   pconf,
-			session: p.replica.GetReplica(pconf.Primary.GetAddress()),
+			session: s,
 		}
 		p.parts[pconf.Pid.PartitionIndex] = r
 	}
@@ -251,46 +297,12 @@ func validateHashKey(hashKey []byte) error {
 	return nil
 }
 
-func validateValue(value []byte) error {
-	if value == nil {
-		return fmt.Errorf("InvalidParameter: value must not be nil")
+func validateCompositeKeys(keys []CompositeKey) error {
+	if keys == nil {
+		return fmt.Errorf("InvalidParameter: CompositeKeys must not be nil")
 	}
-	return nil
-}
-
-func validateValues(values [][]byte) error {
-	if values == nil {
-		return fmt.Errorf("InvalidParameter: values must not be nil")
-	}
-	if len(values) == 0 {
-		return fmt.Errorf("InvalidParameter: values must not be empty")
-	}
-	for i, value := range values {
-		if value == nil {
-			return fmt.Errorf("InvalidParameter: values[%d] must not be nil", i)
-		}
-	}
-	return nil
-}
-
-func validateSortKey(sortKey []byte) error {
-	if sortKey == nil {
-		return fmt.Errorf("InvalidParameter: sortkey must not be nil")
-	}
-	return nil
-}
-
-func validateSortKeys(sortKeys [][]byte) error {
-	if sortKeys == nil {
-		return fmt.Errorf("InvalidParameter: sortkeys must not be nil")
-	}
-	if len(sortKeys) == 0 {
-		return fmt.Errorf("InvalidParameter: sortkeys must not be empty")
-	}
-	for i, sortKey := range sortKeys {
-		if sortKey == nil {
-			return fmt.Errorf("InvalidParameter: sortkeys[%d] must not be nil", i)
-		}
+	if len(keys) == 0 {
+		return fmt.Errorf("InvalidParameter: CompositeKeys must not be empty")
 	}
 	return nil
 }
@@ -311,61 +323,35 @@ func WrapError(err error, op OpType) error {
 	return nil
 }
 
+func (p *pegasusTableConnector) wrapPartitionError(err error, gpid *base.Gpid, replica *session.ReplicaSession, opType OpType) error {
+	err = WrapError(err, opType)
+	if err == nil {
+		return nil
+	}
+	perr := err.(*PError)
+	if perr.Err != nil {
+		perr.Err = fmt.Errorf("%s [%s, %s, table=%s]", perr.Err, gpid, replica, p.tableName)
+	} else {
+		perr.Err = fmt.Errorf("[%s, %s, table=%s]", gpid, replica, p.tableName)
+	}
+	return perr
+}
+
 func (p *pegasusTableConnector) Get(ctx context.Context, hashKey []byte, sortKey []byte) ([]byte, error) {
-	b, err := func() ([]byte, error) {
-		if err := validateHashKey(hashKey); err != nil {
-			return nil, err
-		}
-		if err := validateSortKey(sortKey); err != nil {
-			return nil, err
-		}
-
-		key := encodeHashKeySortKey(hashKey, sortKey)
-		gpid, part := p.getPartition(hashKey)
-
-		resp, err := part.Get(ctx, gpid, key)
-		if err == nil {
-			err = base.NewRocksDBErrFromInt(resp.Error)
-		}
-		if err == base.NotFound {
-			// Success for non-existed entry.
-			return nil, nil
-		}
-		if err = p.handleReplicaError(err, gpid, part); err != nil {
-			return nil, err
-		}
-		return resp.Value.Data, nil
-	}()
-	return b, WrapError(err, OpGet)
+	res, err := p.runPartitionOp(ctx, hashKey, &op.Get{HashKey: hashKey, SortKey: sortKey}, OpGet)
+	if err != nil {
+		return nil, err
+	}
+	if res == nil { // indicates the record is not found
+		return nil, nil
+	}
+	return res.([]byte), err
 }
 
 func (p *pegasusTableConnector) SetTTL(ctx context.Context, hashKey []byte, sortKey []byte, value []byte, ttl time.Duration) error {
-	err := func() error {
-		if err := validateHashKey(hashKey); err != nil {
-			return err
-		}
-		if err := validateSortKey(sortKey); err != nil {
-			return err
-		}
-		if err := validateValue(value); err != nil {
-			return err
-		}
-
-		key := encodeHashKeySortKey(hashKey, sortKey)
-		val := &base.Blob{Data: value}
-		gpid, part := p.getPartition(hashKey)
-		expireTsSec := int32(0)
-		if ttl != 0 {
-			expireTsSec = expireTsSeconds(ttl)
-		}
-
-		resp, err := part.Put(ctx, gpid, key, val, expireTsSec)
-		if err == nil {
-			err = base.NewRocksDBErrFromInt(resp.Error)
-		}
-		return p.handleReplicaError(err, gpid, part)
-	}()
-	return WrapError(err, OpSet)
+	req := &op.Set{HashKey: hashKey, SortKey: sortKey, Value: value, TTL: ttl}
+	_, err := p.runPartitionOp(ctx, hashKey, req, OpSet)
+	return err
 }
 
 func (p *pegasusTableConnector) Set(ctx context.Context, hashKey []byte, sortKey []byte, value []byte) error {
@@ -373,24 +359,9 @@ func (p *pegasusTableConnector) Set(ctx context.Context, hashKey []byte, sortKey
 }
 
 func (p *pegasusTableConnector) Del(ctx context.Context, hashKey []byte, sortKey []byte) error {
-	err := func() error {
-		if err := validateHashKey(hashKey); err != nil {
-			return err
-		}
-		if err := validateSortKey(sortKey); err != nil {
-			return err
-		}
-
-		key := encodeHashKeySortKey(hashKey, sortKey)
-		gpid, part := p.getPartition(hashKey)
-
-		resp, err := part.Del(ctx, gpid, key)
-		if err == nil {
-			err = base.NewRocksDBErrFromInt(resp.Error)
-		}
-		return p.handleReplicaError(err, gpid, part)
-	}()
-	return WrapError(err, OpDel)
+	req := &op.Del{HashKey: hashKey, SortKey: sortKey}
+	_, err := p.runPartitionOp(ctx, hashKey, req, OpDel)
+	return err
 }
 
 func setRequestByOption(options *MultiGetOptions, request *rrdb.MultiGetRequest) {
@@ -401,33 +372,17 @@ func setRequestByOption(options *MultiGetOptions, request *rrdb.MultiGetRequest)
 	request.SortKeyFilterType = rrdb.FilterType(options.SortKeyFilter.Type)
 	request.SortKeyFilterPattern = &base.Blob{Data: options.SortKeyFilter.Pattern}
 	request.Reverse = options.Reverse
+	request.NoValue = options.NoValue
 }
 
 func (p *pegasusTableConnector) MultiGetOpt(ctx context.Context, hashKey []byte, sortKeys [][]byte, options *MultiGetOptions) ([]*KeyValue, bool, error) {
-	kvs, allFetched, err := func() ([]*KeyValue, bool, error) {
-		if err := validateHashKey(hashKey); err != nil {
-			return nil, false, err
-		}
-		if len(sortKeys) != 0 {
-			// sortKeys are nil-able, nil means fetching all entries.
-			if err := validateSortKeys(sortKeys); err != nil {
-				return nil, false, err
-			}
-		}
-
-		request := rrdb.NewMultiGetRequest()
-		request.HashKey = &base.Blob{Data: hashKey}
-		request.SorkKeys = make([]*base.Blob, len(sortKeys))
-		request.StartSortkey = &base.Blob{}
-		request.StopSortkey = &base.Blob{}
-		for i, sortKey := range sortKeys {
-			request.SorkKeys[i] = &base.Blob{Data: sortKey}
-		}
-		setRequestByOption(options, request)
-
-		return p.doMultiGet(ctx, hashKey, request)
-	}()
-	return kvs, allFetched, WrapError(err, OpMultiGet)
+	req := &op.MultiGet{HashKey: hashKey, SortKeys: sortKeys, Req: rrdb.NewMultiGetRequest()}
+	setRequestByOption(options, req.Req)
+	res, err := p.runPartitionOp(ctx, hashKey, req, OpMultiGet)
+	if err != nil {
+		return nil, false, err
+	}
+	return extractMultiGetResult(res.(*op.MultiGetResult))
 }
 
 func (p *pegasusTableConnector) MultiGet(ctx context.Context, hashKey []byte, sortKeys [][]byte) ([]*KeyValue, bool, error) {
@@ -435,59 +390,31 @@ func (p *pegasusTableConnector) MultiGet(ctx context.Context, hashKey []byte, so
 }
 
 func (p *pegasusTableConnector) MultiGetRangeOpt(ctx context.Context, hashKey []byte, startSortKey []byte, stopSortKey []byte, options *MultiGetOptions) ([]*KeyValue, bool, error) {
-	kvs, allFetched, err := func() ([]*KeyValue, bool, error) {
-		if err := validateHashKey(hashKey); err != nil {
-			return nil, false, err
+	req := &op.MultiGet{HashKey: hashKey, StartSortkey: startSortKey, StopSortkey: stopSortKey, Req: rrdb.NewMultiGetRequest()}
+	setRequestByOption(options, req.Req)
+	res, err := p.runPartitionOp(ctx, hashKey, req, OpMultiGetRange)
+	if err != nil {
+		return nil, false, err
+	}
+	return extractMultiGetResult(res.(*op.MultiGetResult))
+}
+
+func extractMultiGetResult(res *op.MultiGetResult) ([]*KeyValue, bool, error) {
+	if len(res.KVs) == 0 {
+		return nil, res.AllFetched, nil
+	}
+	kvs := make([]*KeyValue, len(res.KVs))
+	for i, blobKv := range res.KVs {
+		kvs[i] = &KeyValue{
+			SortKey: blobKv.Key.Data,
+			Value:   blobKv.Value.Data,
 		}
-
-		request := rrdb.NewMultiGetRequest()
-		request.HashKey = &base.Blob{Data: hashKey}
-		request.StartSortkey = &base.Blob{Data: startSortKey}
-		request.StopSortkey = &base.Blob{Data: stopSortKey}
-		setRequestByOption(options, request)
-
-		return p.doMultiGet(ctx, hashKey, request)
-	}()
-	return kvs, allFetched, WrapError(err, OpMultiGetRange)
+	}
+	return kvs, res.AllFetched, nil
 }
 
 func (p *pegasusTableConnector) MultiGetRange(ctx context.Context, hashKey []byte, startSortKey []byte, stopSortKey []byte) ([]*KeyValue, bool, error) {
 	return p.MultiGetRangeOpt(ctx, hashKey, startSortKey, stopSortKey, DefaultMultiGetOptions)
-}
-
-func (p *pegasusTableConnector) doMultiGet(ctx context.Context, hashKey []byte, request *rrdb.MultiGetRequest) ([]*KeyValue, bool, error) {
-	gpid, part := p.getPartition(hashKey)
-	resp, err := part.MultiGet(ctx, gpid, request)
-
-	if err == nil {
-		err = base.NewRocksDBErrFromInt(resp.Error)
-	}
-
-	allFetched := true
-	if err == base.Incomplete {
-		// partial data is fetched
-		allFetched = false
-		err = nil
-	}
-	if err = p.handleReplicaError(err, gpid, part); err == nil {
-		if len(resp.Kvs) == 0 {
-			return nil, allFetched, nil
-		}
-		kvs := make([]*KeyValue, len(resp.Kvs))
-		for i, blobKv := range resp.Kvs {
-			kvs[i] = &KeyValue{
-				SortKey: blobKv.Key.Data,
-				Value:   blobKv.Value.Data,
-			}
-		}
-
-		sort.Slice(kvs, func(i, j int) bool {
-			return bytes.Compare(kvs[i].SortKey, kvs[j].SortKey) < 0
-		})
-
-		return kvs, allFetched, nil
-	}
-	return nil, false, err
 }
 
 func (p *pegasusTableConnector) MultiSet(ctx context.Context, hashKey []byte, sortKeys [][]byte, values [][]byte) error {
@@ -495,116 +422,24 @@ func (p *pegasusTableConnector) MultiSet(ctx context.Context, hashKey []byte, so
 }
 
 func (p *pegasusTableConnector) MultiSetOpt(ctx context.Context, hashKey []byte, sortKeys [][]byte, values [][]byte, ttl time.Duration) error {
-	err := func() error {
-		if err := validateHashKey(hashKey); err != nil {
-			return err
-		}
-		if err := validateSortKeys(sortKeys); err != nil {
-			return err
-		}
-		if err := validateValues(values); err != nil {
-			return err
-		}
-		if len(sortKeys) != len(values) {
-			return fmt.Errorf("InvalidParameter: unmatched key-value pairs: len(sortKeys)=%d len(values)=%d",
-				len(sortKeys), len(values))
-		}
-
-		request := rrdb.NewMultiPutRequest()
-		request.HashKey = &base.Blob{Data: hashKey}
-		request.Kvs = make([]*rrdb.KeyValue, len(sortKeys))
-		for i := 0; i < len(sortKeys); i++ {
-			request.Kvs[i] = &rrdb.KeyValue{
-				Key:   &base.Blob{Data: sortKeys[i]},
-				Value: &base.Blob{Data: values[i]},
-			}
-		}
-		request.ExpireTsSeconds = 0
-		if ttl != 0 {
-			request.ExpireTsSeconds = expireTsSeconds(ttl)
-		}
-
-		return p.doMultiSet(ctx, hashKey, request)
-	}()
-	return WrapError(err, OpMultiSet)
-}
-
-func (p *pegasusTableConnector) doMultiSet(ctx context.Context, hashKey []byte, request *rrdb.MultiPutRequest) error {
-
-	gpid, part := p.getPartition(hashKey)
-	resp, err := part.MultiSet(ctx, gpid, request)
-
-	if err == nil {
-		err = base.NewRocksDBErrFromInt(resp.Error)
-	}
-
-	if err = p.handleReplicaError(err, gpid, part); err == nil {
-		return nil
-	}
+	req := &op.MultiSet{HashKey: hashKey, SortKeys: sortKeys, Values: values, TTL: ttl}
+	_, err := p.runPartitionOp(ctx, hashKey, req, OpMultiSet)
 	return err
 }
 
 func (p *pegasusTableConnector) MultiDel(ctx context.Context, hashKey []byte, sortKeys [][]byte) error {
-	err := func() error {
-		if err := validateHashKey(hashKey); err != nil {
-			return err
-		}
-		if err := validateSortKeys(sortKeys); err != nil {
-			return err
-		}
-
-		gpid, part := p.getPartition(hashKey)
-
-		request := rrdb.NewMultiRemoveRequest()
-		request.HashKey = &base.Blob{Data: hashKey}
-		request.SorkKeys = make([]*base.Blob, len(sortKeys))
-		for i, sortKey := range sortKeys {
-			request.SorkKeys[i] = &base.Blob{Data: sortKey}
-		}
-
-		resp, err := part.MultiDelete(ctx, gpid, request)
-
-		if err == nil {
-			err = base.NewRocksDBErrFromInt(resp.Error)
-		}
-		return p.handleReplicaError(err, gpid, part)
-	}()
-	return WrapError(err, OpMultiDel)
-}
-
-func (p *pegasusTableConnector) doTTL(ctx context.Context, hashKey []byte, sortKey []byte) (int, error) {
-	if err := validateHashKey(hashKey); err != nil {
-		return 0, err
-	}
-	if err := validateSortKey(sortKey); err != nil {
-		return 0, err
-	}
-
-	key := encodeHashKeySortKey(hashKey, sortKey)
-	gpid, part := p.getPartition(hashKey)
-
-	resp, err := part.TTL(ctx, gpid, key)
-	if err == nil {
-		err = base.NewRocksDBErrFromInt(resp.Error)
-		if err == base.NotFound {
-			return -2, nil
-		}
-	}
-	if err = p.handleReplicaError(err, gpid, part); err != nil {
-		return -2, err
-	}
-	return int(resp.GetTTLSeconds()), nil
+	_, err := p.runPartitionOp(ctx, hashKey, &op.MultiDel{HashKey: hashKey, SortKeys: sortKeys}, OpMultiDel)
+	return err
 }
 
 // -2 means entry not found.
 func (p *pegasusTableConnector) TTL(ctx context.Context, hashKey []byte, sortKey []byte) (int, error) {
-	ttl, err := p.doTTL(ctx, hashKey, sortKey)
-	return ttl, WrapError(err, OpTTL)
+	res, err := p.runPartitionOp(ctx, hashKey, &op.TTL{HashKey: hashKey, SortKey: sortKey}, OpTTL)
+	return res.(int), err
 }
 
 func (p *pegasusTableConnector) Exist(ctx context.Context, hashKey []byte, sortKey []byte) (bool, error) {
-	ttl, err := p.doTTL(ctx, hashKey, sortKey)
-
+	ttl, err := p.TTL(ctx, hashKey, sortKey)
 	if err == nil {
 		if ttl == -2 {
 			return false, nil
@@ -650,11 +485,11 @@ func (p *pegasusTableConnector) GetScanner(ctx context.Context, hashKey []byte, 
 
 		cmp := bytes.Compare(start.Data, stop.Data)
 		if cmp < 0 || (cmp == 0 && options.StartInclusive && options.StopInclusive) {
-			gpid, err := p.getGpid(start.Data)
-			if err != nil && gpid != nil {
+			gpid, partitionHash, err := p.getGpid(start.Data)
+			if err != nil && (gpid != nil || partitionHash != 0) {
 				return nil, err
 			}
-			return newPegasusScanner(p, gpid, options, start, stop), nil
+			return newPegasusScanner(p, gpid, partitionHash, options, start, stop), nil
 		}
 		return nil, fmt.Errorf("the scanning interval MUST NOT BE EMPTY")
 	}()
@@ -665,7 +500,7 @@ func (p *pegasusTableConnector) GetUnorderedScanners(ctx context.Context, maxSpl
 	options *ScannerOptions) ([]Scanner, error) {
 	scanners, err := func() ([]Scanner, error) {
 		if maxSplitCount <= 0 {
-			panic(fmt.Sprintf("invalid maxSplitCount: %d", maxSplitCount))
+			return nil, fmt.Errorf("invalid maxSplitCount: %d", maxSplitCount)
 		}
 		allGpid := p.getAllGpid()
 		total := len(allGpid)
@@ -693,11 +528,13 @@ func (p *pegasusTableConnector) GetUnorderedScanners(ctx context.Context, maxSpl
 				sliceLen = k
 			}
 			gpidSlice := make([]*base.Gpid, sliceLen)
+			hashSlice := make([]uint64, sliceLen)
 			for j := 0; j < sliceLen; j++ {
 				gpidSlice[j] = allGpid[id]
+				hashSlice[j] = uint64(id)
 				id++
 			}
-			scanners[i] = newPegasusScannerForUnorderedScanners(p, gpidSlice, options)
+			scanners[i] = newPegasusScannerForUnorderedScanners(p, gpidSlice, hashSlice, options)
 		}
 		return scanners, nil
 	}()
@@ -706,86 +543,120 @@ func (p *pegasusTableConnector) GetUnorderedScanners(ctx context.Context, maxSpl
 
 func (p *pegasusTableConnector) CheckAndSet(ctx context.Context, hashKey []byte, checkSortKey []byte, checkType CheckType,
 	checkOperand []byte, setSortKey []byte, setValue []byte, options *CheckAndSetOptions) (*CheckAndSetResult, error) {
-	result, err := func() (*CheckAndSetResult, error) {
-		if err := validateHashKey(hashKey); err != nil {
-			return nil, err
-		}
 
-		gpid, part := p.getPartition(hashKey)
+	if options == nil {
+		options = &CheckAndSetOptions{}
+	}
+	request := rrdb.NewCheckAndSetRequest()
+	request.CheckType = rrdb.CasCheckType(checkType)
+	request.CheckOperand = &base.Blob{Data: checkOperand}
+	request.CheckSortKey = &base.Blob{Data: checkSortKey}
+	request.HashKey = &base.Blob{Data: hashKey}
+	request.SetExpireTsSeconds = int32(options.SetValueTTLSeconds)
+	request.SetSortKey = &base.Blob{Data: setSortKey}
+	request.SetValue = &base.Blob{Data: setValue}
+	request.ReturnCheckValue = options.ReturnCheckValue
+	if !bytes.Equal(checkSortKey, setSortKey) {
+		request.SetDiffSortKey = true
+	} else {
+		request.SetDiffSortKey = false
+	}
 
-		request := rrdb.NewCheckAndSetRequest()
-		request.CheckType = rrdb.CasCheckType(checkType)
-		request.CheckOperand = &base.Blob{Data: checkOperand}
-		request.CheckSortKey = &base.Blob{Data: checkSortKey}
-		request.HashKey = &base.Blob{Data: hashKey}
-		request.SetExpireTsSeconds = 0
-		if options.SetValueTTLSeconds != 0 {
-			request.SetExpireTsSeconds = expireTsSeconds(time.Second * time.Duration(options.SetValueTTLSeconds))
-		}
-		request.SetSortKey = &base.Blob{Data: setSortKey}
-		request.SetValue = &base.Blob{Data: setValue}
-		request.ReturnCheckValue = options.ReturnCheckValue
-		if !bytes.Equal(checkSortKey, setSortKey) {
-			request.SetDiffSortKey = true
-		} else {
-			request.SetDiffSortKey = false
-		}
-
-		resp, err := part.CheckAndSet(ctx, gpid, request)
-
-		if err == nil {
-			err = base.NewRocksDBErrFromInt(resp.Error)
-		}
-		if err == base.TryAgain {
-			err = nil
-		}
-		if err = p.handleReplicaError(err, gpid, part); err != nil {
-			return nil, err
-		}
-
-		result := &CheckAndSetResult{
-			SetSucceed:         resp.Error == 0,
-			CheckValueReturned: resp.CheckValueReturned,
-			CheckValueExist:    resp.CheckValueReturned && resp.CheckValueExist,
-		}
-		if resp.CheckValueReturned && resp.CheckValueExist && resp.CheckValue != nil && resp.CheckValue.Data != nil && len(resp.CheckValue.Data) != 0 {
-			result.CheckValue = resp.CheckValue.Data
-		}
-		return result, nil
-	}()
-	return result, WrapError(err, OpCheckAndSet)
+	req := &op.CheckAndSet{Req: request}
+	res, err := p.runPartitionOp(ctx, hashKey, req, OpCheckAndSet)
+	if err != nil {
+		return nil, err
+	}
+	casRes := res.(*op.CheckAndSetResult)
+	return &CheckAndSetResult{
+		SetSucceed:         casRes.SetSucceed,
+		CheckValue:         casRes.CheckValue,
+		CheckValueExist:    casRes.CheckValueExist,
+		CheckValueReturned: casRes.CheckValueReturned,
+	}, nil
 }
 
 func (p *pegasusTableConnector) SortKeyCount(ctx context.Context, hashKey []byte) (int64, error) {
-	count, err := func() (int64, error) {
-		if err := validateHashKey(hashKey); err != nil {
-			return 0, err
+	res, err := p.runPartitionOp(ctx, hashKey, &op.SortKeyCount{HashKey: hashKey}, OpSortKeyCount)
+	if err != nil {
+		return 0, err
+	}
+	return res.(int64), nil
+}
+
+func (p *pegasusTableConnector) Incr(ctx context.Context, hashKey []byte, sortKey []byte, increment int64) (int64, error) {
+	req := &op.Incr{HashKey: hashKey, SortKey: sortKey, Increment: increment}
+	res, err := p.runPartitionOp(ctx, hashKey, req, OpIncr)
+	if err != nil {
+		return 0, err
+	}
+	return res.(int64), nil
+}
+
+func (p *pegasusTableConnector) runPartitionOp(ctx context.Context, hashKey []byte, req op.Request, optype OpType) (interface{}, error) {
+	// validate arguments
+	if err := req.Validate(); err != nil {
+		return 0, WrapError(err, optype)
+	}
+	partitionHash := crc64Hash(hashKey)
+	gpid, part := p.getPartition(partitionHash)
+	res, err := retryFailOver(ctx, func() (confUpdated bool, result interface{}, retry bool, err error) {
+		result, err = req.Run(ctx, gpid, partitionHash, part)
+		confUpdated, retry, err = p.handleReplicaError(err, part)
+		return
+	})
+	return res, p.wrapPartitionError(err, gpid, part, optype)
+}
+
+func (p *pegasusTableConnector) BatchGet(ctx context.Context, keys []CompositeKey) (values [][]byte, err error) {
+	v, err := func() ([][]byte, error) {
+		if err := validateCompositeKeys(keys); err != nil {
+			return nil, err
 		}
 
-		gpid, part := p.getPartition(hashKey)
-		resp, err := part.SortKeyCount(ctx, gpid, &base.Blob{Data: hashKey})
-		if err == nil {
-			err = base.NewRocksDBErrFromInt(resp.Error)
+		values = make([][]byte, len(keys))
+		funcs := make([]func() error, 0, len(keys))
+		for i := 0; i < len(keys); i++ {
+			idx := i
+			funcs = append(funcs, func() (subErr error) {
+				key := keys[idx]
+				values[idx], subErr = p.Get(ctx, key.HashKey, key.SortKey)
+				if subErr != nil {
+					values[idx] = nil
+					return subErr
+				}
+				return nil
+			})
 		}
-		if err = p.handleReplicaError(err, gpid, part); err != nil {
-			return 0, err
-		}
-		return resp.Count, nil
+		return values, kerrors.AggregateGoroutines(funcs...)
 	}()
-	return count, WrapError(err, OpSortKeyCount)
+	return v, WrapError(err, OpBatchGet)
 }
 
-func getPartitionIndex(hashKey []byte, partitionCount int) int32 {
-	return int32(crc64Hash(hashKey) % uint64(partitionCount))
+func (p *pegasusTableConnector) isPartitionValid(index int) bool {
+	if index < 0 || index >= len(p.parts) {
+		return false
+	}
+	return p.parts[index].pconf.Ballot > 0
 }
 
-func (p *pegasusTableConnector) getPartition(hashKey []byte) (*base.Gpid, *session.ReplicaSession) {
+func (p *pegasusTableConnector) getPartitionIndex(partitionHash uint64) int32 {
+	partitionCount := int32(len(p.parts))
+	index := int32(partitionHash % uint64(partitionCount))
+	if !p.isPartitionValid(int(index)) {
+		p.logger.Printf("table [%s] partition[%d] is not valid now, requests will send to partition[%d]", p.tableName, index, index-partitionCount/2)
+		index -= partitionCount / 2
+	}
+	return index
+}
+
+func (p *pegasusTableConnector) getPartition(partitionHash uint64) (*base.Gpid, *session.ReplicaSession) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	gpid := &base.Gpid{
 		Appid:          p.appID,
-		PartitionIndex: getPartitionIndex(hashKey, len(p.parts)),
+		PartitionIndex: p.getPartitionIndex(partitionHash),
 	}
 	part := p.parts[gpid.PartitionIndex].session
 
@@ -803,43 +674,63 @@ func (p *pegasusTableConnector) Close() error {
 	return nil
 }
 
-func (p *pegasusTableConnector) handleReplicaError(err error, gpid *base.Gpid, replica *session.ReplicaSession) error {
+func (p *pegasusTableConnector) handleReplicaError(err error, replica *session.ReplicaSession) (bool, bool, error) {
 	if err != nil {
 		confUpdate := false
+		retry := false
 
 		switch err {
+		case base.ERR_OK:
+			// should not happen
+			return false, false, nil
+
 		case base.ERR_TIMEOUT:
 		case context.DeadlineExceeded:
+		case context.Canceled:
 			// timeout will not trigger a configuration update
 
 		case base.ERR_NOT_ENOUGH_MEMBER:
 		case base.ERR_CAPACITY_EXCEEDED:
 
+		case base.ERR_BUSY:
+			// throttled by server, skip confUpdate
+		case base.ERR_SPLITTING:
+			// table is executing partition split, skip confUpdate
+
 		default:
 			confUpdate = true
+			retry = true
+		}
+
+		switch err {
+		case base.ERR_BUSY:
+			err = errors.New(err.Error() + " Rate of requests exceeds the throughput limit")
+		case base.ERR_INVALID_STATE:
+			err = errors.New(err.Error() + " The target replica is not primary")
+		case base.ERR_OBJECT_NOT_FOUND:
+			err = errors.New(err.Error() + " The replica server doesn't serve this partition")
+		case base.ERR_SPLITTING:
+			err = errors.New(err.Error() + " The table is executing partition split")
+		case base.ERR_PARENT_PARTITION_MISUSED:
+			err = errors.New(err.Error() + " The table finish partition split, will update config")
+			retry = false
 		}
 
 		if confUpdate {
 			// we need to check if there's newer configuration.
-			p.tryConfUpdate()
+			p.tryConfUpdate(err, replica)
 		}
 
-		// add gpid and remote address to error
-		perr := WrapError(err, 0).(*PError)
-		if perr.Err != nil {
-			perr.Err = fmt.Errorf("%s [%s, %s]", perr.Err, gpid, replica)
-		} else {
-			perr.Err = fmt.Errorf("[%s, %s]", gpid, replica)
-		}
-		return perr
+		return confUpdate, retry, err
 	}
-	return nil
+	return false, false, nil
 }
 
-/// Don't bother if there's ongoing attempt.
-func (p *pegasusTableConnector) tryConfUpdate() {
+// tryConfUpdate makes an attempt to update table configuration by querying meta server.
+func (p *pegasusTableConnector) tryConfUpdate(err error, replica session.NodeSession) {
 	select {
 	case p.confUpdateCh <- true:
+		p.logger.Printf("trigger configuration update of table [%s] due to RPC failure [%s] to %s", p.tableName, err, replica)
 	default:
 	}
 }
@@ -880,23 +771,25 @@ func (p *pegasusTableConnector) selfUpdate() bool {
 	return true
 }
 
-func (p *pegasusTableConnector) getGpid(key []byte) (*base.Gpid, error) {
+func (p *pegasusTableConnector) getGpid(key []byte) (*base.Gpid, uint64, error) {
 	if key == nil || len(key) < 2 {
-		return nil, fmt.Errorf("unable to getGpid by key: %s", key)
+		return nil, 0, fmt.Errorf("unable to getGpid by key: %s", key)
 	}
 
 	hashKeyLen := 0xFFFF & binary.BigEndian.Uint16(key[:2])
 	if hashKeyLen != 0xFFFF && int(2+hashKeyLen) <= len(key) {
 		gpid := &base.Gpid{Appid: p.appID}
+		var partitionHash uint64
 		if hashKeyLen == 0 {
-			gpid.PartitionIndex = int32(crc64Hash(key[2:]) % uint64(len(p.parts)))
+			partitionHash = crc64Hash(key[2:])
 		} else {
-			gpid.PartitionIndex = int32(crc64Hash(key[2:hashKeyLen+2]) % uint64(len(p.parts)))
+			partitionHash = crc64Hash(key[2 : hashKeyLen+2])
 		}
-		return gpid, nil
+		gpid.PartitionIndex = int32(partitionHash % uint64(len(p.parts)))
+		return gpid, partitionHash, nil
 
 	}
-	return nil, fmt.Errorf("unable to getGpid, hashKey length invalid")
+	return nil, 0, fmt.Errorf("unable to getGpid, hashKey length invalid")
 }
 
 func (p *pegasusTableConnector) getAllGpid() []*base.Gpid {

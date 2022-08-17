@@ -17,53 +17,39 @@ import (
 	"github.com/33cn/chain33/system/store/mavl/db/ticket"
 	"github.com/33cn/chain33/types"
 	farm "github.com/dgryski/go-farm"
-	"github.com/golang/protobuf/proto"
-	"github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru"
 )
 
 const (
-	hashNodePrefix       = "_mh_"
-	leafNodePrefix       = "_mb_"
-	curMaxBlockHeight    = "_..mcmbh.._"
-	rootHashHeightPrefix = "_mrhp_"
+	hashNodePrefix             = "_mh_"
+	leafNodePrefix             = "_mb_"
+	curMaxBlockHeight          = "_..mcmbh.._"
+	rootHashHeightPrefix       = "_mrhp_"
+	tkCloseCacheLen      int32 = 10 * 10000
 )
 
 var (
 	// ErrNodeNotExist node is not exist
-	ErrNodeNotExist  = errors.New("ErrNodeNotExist")
-	treelog          = log.New("module", "mavl")
-	emptyRoot        [32]byte
-	enableMavlPrefix bool
-	// 是否开启MVCC
-	enableMvcc bool
+	ErrNodeNotExist = errors.New("ErrNodeNotExist")
+	treelog         = log.New("module", "mavl")
+	emptyRoot       [32]byte
 	// 当前树的最大高度
 	maxBlockHeight int64
 	heightMtx      sync.Mutex
-	//
-	enableMemTree bool
-	enableMemVal  bool
-	memTree       MemTreeOpera
-	tkCloseCache  MemTreeOpera
+	memTree        MemTreeOpera
+	tkCloseCache   MemTreeOpera
 )
 
-// EnableMavlPrefix 使能mavl加前缀
-func EnableMavlPrefix(enable bool) {
-	enableMavlPrefix = enable
-}
-
-// EnableMVCC 使能MVCC
-func EnableMVCC(enable bool) {
-	enableMvcc = enable
-}
-
-// EnableMemTree 使能mavl数据载入内存
-func EnableMemTree(enable bool) {
-	enableMemTree = enable
-}
-
-// EnableMemVal 使能mavl叶子节点数据载入内存
-func EnableMemVal(enable bool) {
-	enableMemVal = enable
+// InitGlobalMem 初始化全局变量
+func InitGlobalMem(treeCfg *TreeConfig) {
+	// 使能情况下非空创建当前整tree的缓存
+	if treeCfg.EnableMemTree && memTree == nil {
+		memTree = NewTreeMap(50 * 10000)
+		if treeCfg.TkCloseCacheLen == 0 {
+			treeCfg.TkCloseCacheLen = tkCloseCacheLen
+		}
+		tkCloseCache = NewTreeARC(int(treeCfg.TkCloseCacheLen))
+	}
 }
 
 // ReleaseGlobalMem 释放全局缓存
@@ -74,6 +60,17 @@ func ReleaseGlobalMem() {
 	if tkCloseCache != nil {
 		tkCloseCache = nil
 	}
+}
+
+// TreeConfig ...
+type TreeConfig struct {
+	EnableMavlPrefix bool
+	EnableMVCC       bool
+	EnableMavlPrune  bool
+	PruneHeight      int32
+	EnableMemTree    bool
+	EnableMemVal     bool
+	TkCloseCacheLen  int32
 }
 
 type memNode struct {
@@ -93,30 +90,28 @@ type Tree struct {
 	obsoleteNode map[uintkey]struct{}
 	updateNode   map[uintkey]*memNode
 	tkCloseNode  map[uintkey]*memNode
+	config       *TreeConfig
 }
 
 // NewTree 新建一个merkle avl 树
-func NewTree(db dbm.DB, sync bool) *Tree {
+func NewTree(db dbm.DB, sync bool, treeCfg *TreeConfig) *Tree {
 	if db == nil {
 		// In-memory IAVLTree
 		return &Tree{
 			obsoleteNode: make(map[uintkey]struct{}),
 			updateNode:   make(map[uintkey]*memNode),
 			tkCloseNode:  make(map[uintkey]*memNode),
+			config:       treeCfg,
 		}
 	}
 	// Persistent IAVLTree
 	ndb := newNodeDB(db, sync)
-	// 使能情况下非空创建当前整tree的缓存
-	if enableMemTree && memTree == nil {
-		memTree = NewTreeMap(50 * 10000)
-		tkCloseCache = NewTreeARC(10 * 10000)
-	}
 	return &Tree{
 		ndb:          ndb,
 		obsoleteNode: make(map[uintkey]struct{}),
 		updateNode:   make(map[uintkey]*memNode),
 		tkCloseNode:  make(map[uintkey]*memNode),
+		config:       treeCfg,
 	}
 }
 
@@ -185,7 +180,7 @@ func (t *Tree) Hash() []byte {
 	}
 	hash := t.root.Hash(t)
 	// 更新memTree
-	if enableMemTree && memTree != nil && tkCloseCache != nil {
+	if t.config != nil && t.config.EnableMemTree && memTree != nil && tkCloseCache != nil {
 		for k := range t.obsoleteNode {
 			memTree.Delete(k)
 		}
@@ -206,9 +201,9 @@ func (t *Tree) Save() []byte {
 		return nil
 	}
 	if t.ndb != nil {
-		if enablePrune && t.isRemoveLeafCountKey() {
+		if t.config != nil && t.config.EnableMavlPrune && t.isRemoveLeafCountKey() {
 			//DelLeafCountKV 需要先提前将leafcoutkey删除,这里需先于t.ndb.Commit()
-			err := DelLeafCountKV(t.ndb.db, t.blockHeight)
+			err := DelLeafCountKV(t.ndb.db, t.blockHeight, t.config)
 			if err != nil {
 				treelog.Error("Tree.Save", "DelLeafCountKV err", err)
 			}
@@ -216,7 +211,7 @@ func (t *Tree) Save() []byte {
 		saveNodeNo := t.root.save(t)
 		treelog.Debug("Tree.Save", "saveNodeNo", saveNodeNo, "tree height", t.blockHeight)
 		// 保存每个高度的roothash
-		if enablePrune {
+		if t.config != nil && t.config.EnableMavlPrune {
 			err := t.root.saveRootHash(t)
 			if err != nil {
 				treelog.Error("Tree.Save", "saveRootHash err", err)
@@ -225,17 +220,17 @@ func (t *Tree) Save() []byte {
 
 		beg := types.Now()
 		err := t.ndb.Commit()
-		treelog.Info("tree.commit", "cost", types.Since(beg))
+		treelog.Debug("tree.commit", "cost", types.Since(beg))
 		if err != nil {
 			return nil
 		}
 		// 该线程应只允许一个
-		if enablePrune && !isPruning() &&
-			pruneHeight != 0 &&
-			t.blockHeight%int64(pruneHeight) == 0 &&
-			t.blockHeight/int64(pruneHeight) > 1 {
+		if t.config != nil && t.config.EnableMavlPrune && !isPruning() &&
+			t.config.PruneHeight != 0 &&
+			t.blockHeight%int64(t.config.PruneHeight) == 0 &&
+			t.blockHeight/int64(t.config.PruneHeight) > 1 {
 			wg.Add(1)
-			go pruning(t.ndb.db, t.blockHeight)
+			go pruning(t.ndb.db, t.blockHeight, t.config)
 		}
 	}
 	return t.root.hash
@@ -290,11 +285,7 @@ func (t *Tree) Proof(key []byte) (value []byte, proofBytes []byte, exists bool) 
 	}
 	var mavlproof types.MAVLProof
 	mavlproof.InnerNodes = proof.InnerNodes
-	proofBytes, err := proto.Marshal(&mavlproof)
-	if err != nil {
-		treelog.Error("Proof proto.Marshal err!", "err", err)
-		return nil, nil, false
-	}
+	proofBytes = types.Encode(&mavlproof)
 	return value, proofBytes, true
 }
 
@@ -328,7 +319,7 @@ func (t *Tree) getMaxBlockHeight() int64 {
 		return 0
 	}
 	h := &types.Int64{}
-	err = proto.Unmarshal(value, h)
+	err = types.Decode(value, h)
 	if err != nil {
 		return 0
 	}
@@ -341,11 +332,7 @@ func (t *Tree) setMaxBlockHeight(height int64) error {
 	}
 	h := &types.Int64{}
 	h.Data = height
-	value, err := proto.Marshal(h)
-	if err != nil {
-		return err
-	}
-	t.ndb.batch.Set([]byte(curMaxBlockHeight), value)
+	t.ndb.batch.Set([]byte(curMaxBlockHeight), types.Encode(h))
 	return nil
 }
 
@@ -384,7 +371,7 @@ func (t *Tree) RemoveLeafCountKey(height int64) {
 		value := make([]byte, len(it.Value()))
 		copy(value, it.Value())
 		pData := &types.StoreNode{}
-		err := proto.Unmarshal(value, pData)
+		err := types.Decode(value, pData)
 		if err == nil {
 			keys = append(keys, pData.Key)
 		}
@@ -398,9 +385,7 @@ func (t *Tree) RemoveLeafCountKey(height int64) {
 			treelog.Debug("RemoveLeafCountKey:", "height", height, "key:", string(k), "hash:", common.ToHex(hash))
 		}
 	}
-	if err := batch.Write(); err != nil {
-		return
-	}
+	dbm.MustWrite(batch)
 }
 
 // Iterate 依次迭代遍历树的所有键
@@ -476,7 +461,7 @@ func (ndb *nodeDB) GetNode(t *Tree, hash []byte) (*Node, error) {
 		}
 	}
 	//从memtree中获取
-	if enableMemTree {
+	if t != nil && t.config != nil && t.config.EnableMemTree {
 		node, err := getNodeMemTree(hash)
 		if err == nil {
 			return node, nil
@@ -497,8 +482,8 @@ func (ndb *nodeDB) GetNode(t *Tree, hash []byte) (*Node, error) {
 	node.persisted = true
 	ndb.cacheNode(node)
 	// Save node hashInt64 to memTree
-	if enableMemTree {
-		updateGlobalMemTree(node)
+	if t != nil && t.config != nil && t.config.EnableMemTree {
+		updateGlobalMemTree(node, t.config)
 	}
 	return node, nil
 }
@@ -534,17 +519,13 @@ func (ndb *nodeDB) SaveNode(t *Tree, node *Node) {
 	// Save node bytes to db
 	storenode := node.storeNode(t)
 	ndb.batch.Set(node.hash, storenode)
-	if enablePrune && node.height == 0 {
+	if t.config != nil && t.config.EnableMavlPrune && node.height == 0 {
 		//save leafnode key&hash
 		k := genLeafCountKey(node.key, node.hash, t.blockHeight, len(node.hash))
 		data := &types.PruneData{
 			Hashs: getHashNode(node),
 		}
-		v, err := proto.Marshal(data)
-		if err != nil {
-			panic(err)
-		}
-		ndb.batch.Set(k, v)
+		ndb.batch.Set(k, types.Encode(data))
 	}
 	node.persisted = true
 	ndb.cacheNode(node)
@@ -596,11 +577,11 @@ func getNodeMemTree(hash []byte) (*Node, error) {
 }
 
 // Save node hashInt64 to memTree
-func updateGlobalMemTree(node *Node) {
-	if node == nil || memTree == nil || tkCloseCache == nil {
+func updateGlobalMemTree(node *Node, treeCfg *TreeConfig) {
+	if node == nil || memTree == nil || tkCloseCache == nil || treeCfg == nil {
 		return
 	}
-	if !enableMemVal && node.height == 0 {
+	if !treeCfg.EnableMemVal && node.height == 0 {
 		return
 	}
 	memN := &memNode{
@@ -611,7 +592,7 @@ func updateGlobalMemTree(node *Node) {
 	if node.height == 0 {
 		if bytes.HasPrefix(node.key, ticket.TicketPrefix) {
 			tk := &ticket.Ticket{}
-			err := proto.Unmarshal(node.value, tk)
+			err := types.Decode(node.value, tk)
 			if err == nil && tk.Status == ticket.StatusCloseTicket { //ticket为close状态下不做存储
 				isTkCloseNode = true
 			}
@@ -636,7 +617,7 @@ func updateLocalMemTree(t *Tree, node *Node) {
 	if t == nil || node == nil {
 		return
 	}
-	if !enableMemVal && node.height == 0 {
+	if t.config != nil && !t.config.EnableMemVal && node.height == 0 {
 		return
 	}
 	if t.updateNode != nil && t.tkCloseNode != nil {
@@ -648,7 +629,7 @@ func updateLocalMemTree(t *Tree, node *Node) {
 		if node.height == 0 {
 			if bytes.HasPrefix(node.key, ticket.TicketPrefix) {
 				tk := &ticket.Ticket{}
-				err := proto.Unmarshal(node.value, tk)
+				err := types.Decode(node.value, tk)
 				if err == nil && tk.Status == ticket.StatusCloseTicket { //ticket为close状态下不做存储
 					isTkCloseNode = true
 				}
@@ -705,19 +686,16 @@ func (ndb *nodeDB) Commit() error {
 	defer ndb.mtx.Unlock()
 
 	// Write saves
-	err := ndb.batch.Write()
-	if err != nil {
-		treelog.Error("Commit batch.Write err", "err", err)
-	}
+	dbm.MustWrite(ndb.batch)
 
 	ndb.batch = nil
 	ndb.orphans = make(map[string]struct{})
-	return err
+	return nil
 }
 
 // SetKVPair 设置kv对外接口
-func SetKVPair(db dbm.DB, storeSet *types.StoreSet, sync bool) ([]byte, error) {
-	tree := NewTree(db, sync)
+func SetKVPair(db dbm.DB, storeSet *types.StoreSet, sync bool, treeCfg *TreeConfig) ([]byte, error) {
+	tree := NewTree(db, sync, treeCfg)
 	tree.SetBlockHeight(storeSet.Height)
 	err := tree.Load(storeSet.StateHash)
 	if err != nil {
@@ -730,8 +708,8 @@ func SetKVPair(db dbm.DB, storeSet *types.StoreSet, sync bool) ([]byte, error) {
 }
 
 // GetKVPair 获取kv对外接口
-func GetKVPair(db dbm.DB, storeGet *types.StoreGet) ([][]byte, error) {
-	tree := NewTree(db, true)
+func GetKVPair(db dbm.DB, storeGet *types.StoreGet, treeCfg *TreeConfig) ([][]byte, error) {
+	tree := NewTree(db, true, treeCfg)
 	err := tree.Load(storeGet.StateHash)
 	values := make([][]byte, len(storeGet.Keys))
 	if err != nil {
@@ -747,8 +725,8 @@ func GetKVPair(db dbm.DB, storeGet *types.StoreGet) ([][]byte, error) {
 }
 
 // GetKVPairProof 获取指定k:v pair的proof证明
-func GetKVPairProof(db dbm.DB, roothash []byte, key []byte) ([]byte, error) {
-	tree := NewTree(db, true)
+func GetKVPairProof(db dbm.DB, roothash []byte, key []byte, treeCfg *TreeConfig) ([]byte, error) {
+	tree := NewTree(db, true, treeCfg)
 	err := tree.Load(roothash)
 	if err != nil {
 		return nil, err
@@ -761,8 +739,8 @@ func GetKVPairProof(db dbm.DB, roothash []byte, key []byte) ([]byte, error) {
 }
 
 // DelKVPair 剔除key对应的节点在本次tree中，返回新的roothash和key对应的value
-func DelKVPair(db dbm.DB, storeDel *types.StoreGet) ([]byte, [][]byte, error) {
-	tree := NewTree(db, true)
+func DelKVPair(db dbm.DB, storeDel *types.StoreGet, treeCfg *TreeConfig) ([]byte, [][]byte, error) {
+	tree := NewTree(db, true, treeCfg)
 	err := tree.Load(storeDel.StateHash)
 	if err != nil {
 		return nil, nil, err
@@ -778,7 +756,7 @@ func DelKVPair(db dbm.DB, storeDel *types.StoreGet) ([]byte, [][]byte, error) {
 }
 
 // DelLeafCountKV 回退时候用于删除叶子节点的索引节点
-func DelLeafCountKV(db dbm.DB, blockHeight int64) error {
+func DelLeafCountKV(db dbm.DB, blockHeight int64, treeCfg *TreeConfig) error {
 	treelog.Debug("RemoveLeafCountKey:", "height", blockHeight)
 	prefix := genRootHashPrefix(blockHeight)
 	it := db.Iterator(prefix, nil, true)
@@ -786,7 +764,7 @@ func DelLeafCountKV(db dbm.DB, blockHeight int64) error {
 	for it.Rewind(); it.Valid(); it.Next() {
 		hash, err := getRootHash(it.Key())
 		if err == nil {
-			tree := NewTree(db, true)
+			tree := NewTree(db, true, treeCfg)
 			err := tree.Load(hash)
 			if err == nil {
 				treelog.Debug("RemoveLeafCountKey:", "height", blockHeight, "root hash:", common.ToHex(hash))
@@ -798,7 +776,7 @@ func DelLeafCountKV(db dbm.DB, blockHeight int64) error {
 }
 
 // VerifyKVPairProof 验证KVPair 的证明
-func VerifyKVPairProof(db dbm.DB, roothash []byte, keyvalue types.KeyValue, proof []byte) bool {
+func VerifyKVPairProof(db dbm.DB, roothash []byte, keyvalue *types.KeyValue, proof []byte) bool {
 
 	//通过传入的keyvalue构造leafnode
 	leafNode := types.LeafNode{Key: keyvalue.GetKey(), Value: keyvalue.GetValue(), Height: 0, Size: 1}
@@ -816,8 +794,8 @@ func VerifyKVPairProof(db dbm.DB, roothash []byte, keyvalue types.KeyValue, proo
 }
 
 // PrintTreeLeaf 通过roothash打印所有叶子节点
-func PrintTreeLeaf(db dbm.DB, roothash []byte) {
-	tree := NewTree(db, true)
+func PrintTreeLeaf(db dbm.DB, roothash []byte, treeCfg *TreeConfig) {
+	tree := NewTree(db, true, treeCfg)
 	err := tree.Load(roothash)
 	if err != nil {
 		return
@@ -834,8 +812,8 @@ func PrintTreeLeaf(db dbm.DB, roothash []byte) {
 }
 
 // IterateRangeByStateHash 在start和end之间的键进行迭代回调[start, end)
-func IterateRangeByStateHash(db dbm.DB, statehash, start, end []byte, ascending bool, fn func([]byte, []byte) bool) {
-	tree := NewTree(db, true)
+func IterateRangeByStateHash(db dbm.DB, statehash, start, end []byte, ascending bool, treeCfg *TreeConfig, fn func([]byte, []byte) bool) {
+	tree := NewTree(db, true, treeCfg)
 	err := tree.Load(statehash)
 	if err != nil {
 		return

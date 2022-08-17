@@ -8,13 +8,18 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sync"
+	"time"
 
+	"github.com/XiaoMi/pegasus-go-client/idl/admin"
 	"github.com/XiaoMi/pegasus-go-client/idl/base"
+	"github.com/XiaoMi/pegasus-go-client/idl/cmd"
+	"github.com/XiaoMi/pegasus-go-client/idl/radmin"
 	"github.com/XiaoMi/pegasus-go-client/idl/replication"
 	"github.com/XiaoMi/pegasus-go-client/idl/rrdb"
 	"github.com/XiaoMi/pegasus-go-client/pegalog"
 	"github.com/XiaoMi/pegasus-go-client/rpc"
-	"github.com/apache/thrift/lib/go/thrift"
+	"github.com/pegasus-kv/thrift/lib/go/thrift"
 )
 
 type PegasusCodec struct {
@@ -33,7 +38,7 @@ func (p *PegasusCodec) Marshal(v interface{}) ([]byte, error) {
 		appId:          r.Gpid.Appid,
 		partitionIndex: r.Gpid.PartitionIndex,
 		threadHash:     gpidToThreadHash(r.Gpid),
-		partitionHash:  0,
+		partitionHash:  r.partitionHash,
 	}
 
 	// skip the first ThriftHeaderBytesLen bytes
@@ -82,7 +87,7 @@ func (p *PegasusCodec) Unmarshal(data []byte, v interface{}) error {
 		// convert string to base.DsnErrCode
 		err, parseErr := base.DsnErrCodeString(ec.Errno)
 		if parseErr != nil {
-			p.logger.Println("failed to unmarshal the heading error code of rpc response: ", parseErr)
+			p.logger.Print("failed to unmarshal the heading error code of rpc response: ", parseErr)
 			return parseErr
 		}
 
@@ -111,10 +116,128 @@ func (p *PegasusCodec) String() string {
 	return "pegasus"
 }
 
+// RegisterRPCResultHandler registers an external RPC that's not including in
+// pegasus-go-client.
+//
+// The following example registers an response handler for Pegasus's remote-command RPC.
+// Usage:
+//
+// ```go
+//   RegisterRpcResultHandler("RPC_CLI_CLI_CALL_ACK", func() RpcResponseResult {
+//     return &RemoteCmdServiceCallCommandResult{Success: new(string)}
+//   })
+// ```
+func RegisterRPCResultHandler(responseAck string, handler func() RpcResponseResult) {
+	nameToResultMapLock.Lock()
+	defer nameToResultMapLock.Unlock()
+	_, found := nameToResultMap[responseAck]
+	if found {
+		panic(fmt.Sprintf("register an registered RPC result handler: %s", responseAck))
+	} else {
+		nameToResultMap[responseAck] = handler
+	}
+}
+
+var nameToResultMapLock sync.Mutex
 var nameToResultMap = map[string]func() RpcResponseResult{
 	"RPC_CM_QUERY_PARTITION_CONFIG_BY_INDEX_ACK": func() RpcResponseResult {
 		return &rrdb.MetaQueryCfgResult{
 			Success: replication.NewQueryCfgResponse(),
+		}
+	},
+	"RPC_CM_CREATE_APP_ACK": func() RpcResponseResult {
+		return &admin.AdminClientCreateAppResult{
+			Success: admin.NewCreateAppResponse(),
+		}
+	},
+	"RPC_CM_DROP_APP_ACK": func() RpcResponseResult {
+		return &admin.AdminClientDropAppResult{
+			Success: admin.NewDropAppResponse(),
+		}
+	},
+	"RPC_CM_RECALL_APP_ACK": func() RpcResponseResult {
+		return &admin.AdminClientRecallAppResult{
+			Success: admin.NewRecallAppResponse(),
+		}
+	},
+	"RPC_CM_LIST_APPS_ACK": func() RpcResponseResult {
+		return &admin.AdminClientListAppsResult{
+			Success: admin.NewListAppsResponse(),
+		}
+	},
+	"RPC_QUERY_APP_INFO_ACK": func() RpcResponseResult {
+		return &admin.AdminClientQueryAppInfoResult{
+			Success: admin.NewQueryAppInfoResponse(),
+		}
+	},
+	"RPC_CM_UPDATE_APP_ENV_ACK": func() RpcResponseResult {
+		return &admin.AdminClientUpdateAppEnvResult{
+			Success: admin.NewUpdateAppEnvResponse(),
+		}
+	},
+	"RPC_CM_QUERY_DUPLICATION_ACK": func() RpcResponseResult {
+		return &admin.AdminClientQueryDuplicationResult{
+			Success: admin.NewDuplicationQueryResponse(),
+		}
+	},
+	"RPC_CM_MODIFY_DUPLICATION_ACK": func() RpcResponseResult {
+		return &admin.AdminClientModifyDuplicationResult{
+			Success: admin.NewDuplicationModifyResponse(),
+		}
+	},
+	"RPC_CM_ADD_DUPLICATION_ACK": func() RpcResponseResult {
+		return &admin.AdminClientAddDuplicationResult{
+			Success: admin.NewDuplicationAddResponse(),
+		}
+	},
+	"RPC_CM_QUERY_BACKUP_POLICY_ACK": func() RpcResponseResult {
+		return &admin.AdminClientQueryBackupPolicyResult{
+			Success: admin.NewQueryBackupPolicyResponse(),
+		}
+	},
+	"RPC_CM_CLUSTER_INFO_ACK": func() RpcResponseResult {
+		return &admin.AdminClientQueryClusterInfoResult{
+			Success: admin.NewClusterInfoResponse(),
+		}
+	},
+	"RPC_CM_CONTROL_META_ACK": func() RpcResponseResult {
+		return &admin.AdminClientMetaControlResult{
+			Success: admin.NewMetaControlResponse(),
+		}
+	},
+	"RPC_CM_LIST_NODES_ACK": func() RpcResponseResult {
+		return &admin.AdminClientListNodesResult{
+			Success: admin.NewListNodesResponse(),
+		}
+	},
+	"RPC_CM_PROPOSE_BALANCER_ACK": func() RpcResponseResult {
+		return &admin.AdminClientBalanceResult{
+			Success: admin.NewBalanceResponse(),
+		}
+	},
+	"RPC_CM_START_BACKUP_APP_ACK": func() RpcResponseResult {
+		return &admin.AdminClientStartBackupAppResult{
+			Success: admin.NewStartBackupAppResponse(),
+		}
+	},
+	"RPC_CM_QUERY_BACKUP_STATUS_ACK": func() RpcResponseResult {
+		return &admin.AdminClientQueryBackupStatusResult{
+			Success: admin.NewQueryBackupStatusResponse(),
+		}
+	},
+	"RPC_CM_START_RESTORE_ACK": func() RpcResponseResult {
+		return &admin.AdminClientRestoreAppResult{
+			Success: admin.NewCreateAppResponse(),
+		}
+	},
+	"RPC_QUERY_DISK_INFO_ACK": func() RpcResponseResult {
+		return &radmin.ReplicaClientQueryDiskInfoResult{
+			Success: radmin.NewQueryDiskInfoResponse(),
+		}
+	},
+	"RPC_REPLICA_DISK_MIGRATE_ACK": func() RpcResponseResult {
+		return &radmin.ReplicaClientDiskMigrateResult{
+			Success: radmin.NewReplicaDiskMigrateResponse(),
 		}
 	},
 	"RPC_RRDB_RRDB_GET_ACK": func() RpcResponseResult {
@@ -172,6 +295,16 @@ var nameToResultMap = map[string]func() RpcResponseResult{
 			Success: rrdb.NewCountResponse(),
 		}
 	},
+	"RPC_RRDB_RRDB_INCR_ACK": func() RpcResponseResult {
+		return &rrdb.RrdbIncrResult{
+			Success: rrdb.NewIncrResponse(),
+		}
+	},
+	"RPC_CLI_CLI_CALL_ACK": func() RpcResponseResult {
+		return &cmd.RemoteCmdServiceCallCommandResult{
+			Success: new(string),
+		}
+	},
 }
 
 // MockCodec is only used for testing.
@@ -225,21 +358,39 @@ type RpcResponseResult interface {
 }
 
 type PegasusRpcCall struct {
-	Args   RpcRequestArgs
-	Result RpcResponseResult
-	Name   string // the rpc's name
-	SeqId  int32
-	Gpid   *base.Gpid
-	RawReq []byte // the marshalled request in bytes
-	Err    error
+	Args          RpcRequestArgs
+	Result        RpcResponseResult
+	Name          string // the rpc's name
+	SeqId         int32
+	Gpid          *base.Gpid
+	partitionHash uint64
+	RawReq        []byte // the marshalled request in bytes
+	Err           error
+
+	// hooks on each stage during rpc processing
+	OnRpcCall time.Time
+	OnRpcSend time.Time
+	OnRpcRecv time.Time
 }
 
-func MarshallPegasusRpc(codec rpc.Codec, seqId int32, gpid *base.Gpid, args RpcRequestArgs, name string) (*PegasusRpcCall, error) {
+func (call *PegasusRpcCall) Trace() string {
+	return fmt.Sprintf("call->%dus->send->%dus->recv->%dus->now",
+		call.OnRpcSend.Sub(call.OnRpcCall)/time.Microsecond,
+		call.OnRpcRecv.Sub(call.OnRpcSend)/time.Microsecond,
+		time.Since(call.OnRpcRecv)/time.Microsecond)
+}
+
+func (call *PegasusRpcCall) TilNow() time.Duration {
+	return time.Since(call.OnRpcCall)
+}
+
+func MarshallPegasusRpc(codec rpc.Codec, seqId int32, gpid *base.Gpid, partitionHash uint64, args RpcRequestArgs, name string) (*PegasusRpcCall, error) {
 	rcall := &PegasusRpcCall{}
 	rcall.Args = args
 	rcall.Name = name
 	rcall.SeqId = seqId
 	rcall.Gpid = gpid
+	rcall.partitionHash = partitionHash
 
 	var err error
 	rcall.RawReq, err = codec.Marshal(rcall)

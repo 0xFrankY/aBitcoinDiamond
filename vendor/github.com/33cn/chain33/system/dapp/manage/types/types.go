@@ -16,20 +16,42 @@ var (
 	// ManageX defines a global string
 	ManageX    = "manage"
 	actionName = map[string]int32{
-		"Modify": ManageActionModifyConfig,
+		"Modify":  ManageActionModifyConfig,
+		"Apply":   ManageActionApplyConfig,
+		"Approve": ManageActionApproveConfig,
 	}
 	logmap = map[int64]*types.LogInfo{
 		// 这里reflect.TypeOf类型必须是proto.Message类型，且是交易的回持结构
-		TyLogModifyConfig: {Ty: reflect.TypeOf(types.ReceiptConfig{}), Name: "LogModifyConfig"},
+		TyLogModifyConfig:  {Ty: reflect.TypeOf(types.ReceiptConfig{}), Name: "LogModifyConfig"},
+		TyLogApplyConfig:   {Ty: reflect.TypeOf(ReceiptApplyConfig{}), Name: "LogApplyConfig"},
+		TyLogApproveConfig: {Ty: reflect.TypeOf(ReceiptApproveConfig{}), Name: "LogApproveConfig"},
 	}
+)
+
+const (
+	//ForkManageExec manage key
+	ForkManageExec = "ForkManageExec"
+	//ForkManageAutonomyEnable enable approve from autonomy
+	ForkManageAutonomyEnable = "ForkManageAutonomyEnable"
 )
 
 func init() {
 	types.AllowUserExec = append(types.AllowUserExec, []byte(ManageX))
-	types.RegistorExecutor(ManageX, NewType())
+	types.RegFork(ManageX, InitFork)
+	types.RegExec(ManageX, InitExecutor)
+}
 
-	types.RegisterDappFork(ManageX, "Enable", 120000)
-	types.RegisterDappFork(ManageX, "ForkManageExec", 400000)
+//InitFork init
+func InitFork(cfg *types.Chain33Config) {
+	cfg.RegisterDappFork(ManageX, "Enable", 0)
+	cfg.RegisterDappFork(ManageX, ForkManageExec, 0)
+	//支持autonomy委员会审批
+	cfg.RegisterDappFork(ManageX, ForkManageAutonomyEnable, 0)
+}
+
+//InitExecutor init Executor
+func InitExecutor(cfg *types.Chain33Config) {
+	types.RegistorExecutor(ManageX, NewType(cfg))
 }
 
 // ManageType defines managetype
@@ -38,20 +60,16 @@ type ManageType struct {
 }
 
 // NewType new a managetype object
-func NewType() *ManageType {
+func NewType(cfg *types.Chain33Config) *ManageType {
 	c := &ManageType{}
 	c.SetChild(c)
+	c.SetConfig(cfg)
 	return c
 }
 
 // GetPayload return manageaction
 func (m *ManageType) GetPayload() types.Message {
 	return &ManageAction{}
-}
-
-// ActionName return action a string name
-func (m ManageType) ActionName(tx *types.Transaction) string {
-	return "config"
 }
 
 // Amount amount

@@ -39,6 +39,8 @@ const (
 	OpScannerClose
 	OpCheckAndSet
 	OpSortKeyCount
+	OpIncr
+	OpBatchGet
 )
 
 var opTypeToStringMap = map[OpType]string{
@@ -59,6 +61,8 @@ var opTypeToStringMap = map[OpType]string{
 	OpScannerClose:         "SCANNER_CLOSE",
 	OpCheckAndSet:          "CHECK_AND_SET",
 	OpSortKeyCount:         "SORTKEY_COUNT",
+	OpIncr:                 "INCR",
+	OpBatchGet:             "BATCH_GET",
 }
 
 func (op OpType) String() string {
@@ -66,5 +70,5 @@ func (op OpType) String() string {
 }
 
 func (e *PError) Error() string {
-	return fmt.Sprintf("pegasus-go-client %s failed: %s", e.Op, e.Err.Error())
+	return fmt.Sprintf("pegasus %s failed: %s", e.Op, e.Err.Error())
 }

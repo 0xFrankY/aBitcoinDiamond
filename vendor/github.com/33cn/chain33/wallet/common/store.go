@@ -9,13 +9,13 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/33cn/chain33/common/crypto"
 	"github.com/33cn/chain33/common/db"
 	"github.com/33cn/chain33/common/log/log15"
 	"github.com/33cn/chain33/common/version"
 	"github.com/33cn/chain33/types"
-	"github.com/golang/protobuf/proto"
 )
 
 var (
@@ -31,12 +31,14 @@ type AddrInfo struct {
 
 // NewStore 新建存储对象
 func NewStore(db db.DB) *Store {
-	return &Store{db: db}
+	return &Store{db: db, blkBatch: db.NewBatch(true)}
 }
 
 // Store 钱包通用数据库存储类，实现对钱包账户数据库操作的基本实现
 type Store struct {
-	db db.DB
+	db        db.DB
+	blkBatch  db.Batch
+	batchLock sync.Mutex
 }
 
 // Close 关闭数据库
@@ -52,6 +54,19 @@ func (store *Store) GetDB() db.DB {
 // NewBatch 新建批处理操作对象接口
 func (store *Store) NewBatch(sync bool) db.Batch {
 	return store.db.NewBatch(sync)
+}
+
+// GetBlockBatch 新建批处理操作对象接口
+func (store *Store) GetBlockBatch(sync bool) db.Batch {
+	store.batchLock.Lock()
+	store.blkBatch.Reset()
+	store.blkBatch.UpdateWriteSync(sync)
+	return store.blkBatch
+}
+
+//FreeBlockBatch free
+func (store *Store) FreeBlockBatch() {
+	store.batchLock.Unlock()
 }
 
 // Get 取值
@@ -87,11 +102,7 @@ func (store *Store) GetAccountByte(update bool, addr string, account *types.Wall
 	}
 	account.TimeStamp = timestamp
 
-	accountbyte, err := proto.Marshal(account)
-	if err != nil {
-		storelog.Error("GetAccountByte", " proto.Marshal error", err)
-		return nil, types.ErrMarshal
-	}
+	accountbyte := types.Encode(account)
 	return accountbyte, nil
 }
 
@@ -138,9 +149,9 @@ func (store *Store) GetAccountByAddr(addr string) (*types.WalletAccountStore, er
 		}
 		return nil, types.ErrAddrNotExist
 	}
-	err = proto.Unmarshal(data, &account)
+	err = types.Decode(data, &account)
 	if err != nil {
-		storelog.Error("GetAccountByAddr", "proto.Unmarshal err:", err)
+		storelog.Error("GetAccountByAddr", "types.Decode err:", err)
 		return nil, types.ErrUnmarshal
 	}
 	return &account, nil
@@ -160,9 +171,9 @@ func (store *Store) GetAccountByLabel(label string) (*types.WalletAccountStore, 
 		}
 		return nil, types.ErrLabelNotExist
 	}
-	err = proto.Unmarshal(data, &account)
+	err = types.Decode(data, &account)
 	if err != nil {
-		storelog.Error("GetAccountByAddr", "proto.Unmarshal err:", err)
+		storelog.Error("GetAccountByAddr", "types.Decode err:", err)
 		return nil, types.ErrUnmarshal
 	}
 	return &account, nil
@@ -183,9 +194,9 @@ func (store *Store) GetAccountByPrefix(addr string) ([]*types.WalletAccountStore
 	WalletAccountStores := make([]*types.WalletAccountStore, len(accbytes))
 	for index, accbyte := range accbytes {
 		var walletaccount types.WalletAccountStore
-		err := proto.Unmarshal(accbyte, &walletaccount)
+		err := types.Decode(accbyte, &walletaccount)
 		if err != nil {
-			storelog.Error("GetAccountByAddr", "proto.Unmarshal err:", err)
+			storelog.Error("GetAccountByAddr", "types.Decode err:", err)
 			return nil, types.ErrUnmarshal
 		}
 		WalletAccountStores[index] = &walletaccount
@@ -202,10 +213,16 @@ func (store *Store) GetTxDetailByIter(TxList *types.ReqWalletTransactionList) (*
 	}
 
 	var txbytes [][]byte
-	//FromTx是空字符串时。默认从最新的交易开始取count个
+	//FromTx是空字符串时，
+	//Direction == 0从最新的交易开始倒序取count个
+	//Direction == 1从最早的交易开始正序取count个
 	if len(TxList.FromTx) == 0 {
 		list := store.NewListHelper()
-		txbytes = list.IteratorScanFromLast(CalcTxKey(""), TxList.Count)
+		if TxList.Direction == 0 {
+			txbytes = list.IteratorScanFromLast(CalcTxKey(""), TxList.Count, db.ListDESC)
+		} else {
+			txbytes = list.IteratorScanFromFirst(CalcTxKey(""), TxList.Count, db.ListASC)
+		}
 		if len(txbytes) == 0 {
 			storelog.Error("GetTxDetailByIter IteratorScanFromLast does not exist tx!")
 			return nil, types.ErrTxNotExist
@@ -222,17 +239,12 @@ func (store *Store) GetTxDetailByIter(TxList *types.ReqWalletTransactionList) (*
 	txDetails.TxDetails = make([]*types.WalletTxDetail, len(txbytes))
 	for index, txdetailbyte := range txbytes {
 		var txdetail types.WalletTxDetail
-		err := proto.Unmarshal(txdetailbyte, &txdetail)
+		err := types.Decode(txdetailbyte, &txdetail)
 		if err != nil {
-			storelog.Error("GetTxDetailByIter", "proto.Unmarshal err:", err)
+			storelog.Error("GetTxDetailByIter", "types.Decode err:", err)
 			return nil, types.ErrUnmarshal
 		}
-		if string(txdetail.Tx.GetExecer()) == "coins" && txdetail.Tx.ActionName() == "withdraw" {
-			//swap from and to
-			txdetail.Fromaddr, txdetail.Tx.To = txdetail.Tx.To, txdetail.Fromaddr
-		}
-		txhash := txdetail.GetTx().Hash()
-		txdetail.Txhash = txhash
+		txdetail.Txhash = txdetail.GetTx().Hash()
 		txDetails.TxDetails[index] = &txdetail
 	}
 	return &txDetails, nil
@@ -271,7 +283,7 @@ func (store *Store) GetEncryptionFlag() int64 {
 
 // SetPasswordHash 保存密码哈希
 func (store *Store) SetPasswordHash(password string, batch db.Batch) error {
-	var WalletPwHash types.WalletPwHash
+	WalletPwHash := &types.WalletPwHash{}
 	//获取一个随机字符串
 	randstr := fmt.Sprintf("fuzamei:$@%s", crypto.CRandHex(16))
 	WalletPwHash.Randstr = randstr

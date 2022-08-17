@@ -7,7 +7,7 @@ package types
 import (
 	"bytes"
 	"encoding/json"
-	"strconv"
+	"strings"
 
 	"github.com/33cn/chain33/common"
 	"github.com/33cn/chain33/types"
@@ -50,7 +50,7 @@ func DecodeLog(execer []byte, rlog *ReceiptData) (*ReceiptDataResult, error) {
 }
 
 // ConvertWalletTxDetailToJSON conver the wallet tx detail to json
-func ConvertWalletTxDetailToJSON(in *types.WalletTxDetails, out *WalletTxDetails) error {
+func ConvertWalletTxDetailToJSON(in *types.WalletTxDetails, out *WalletTxDetails, coinExec string, coinPrecision int64) error {
 	if in == nil || out == nil {
 		return types.ErrInvalidParam
 	}
@@ -66,9 +66,14 @@ func ConvertWalletTxDetailToJSON(in *types.WalletTxDetails, out *WalletTxDetails
 		if err != nil {
 			continue
 		}
-		tran, err := DecodeTx(tx.GetTx())
+		tran, err := DecodeTx(tx.GetTx(), coinPrecision)
 		if err != nil {
 			continue
+		}
+		if tx.Tx.IsWithdraw(coinExec) {
+			//swap from and to
+			tx.Fromaddr, tx.Tx.To = tx.Tx.To, tx.Fromaddr
+			tran.To = tx.Tx.GetRealToAddr()
 		}
 		out.TxDetails = append(out.TxDetails, &WalletTxDetail{
 			Tx:         tran,
@@ -86,7 +91,7 @@ func ConvertWalletTxDetailToJSON(in *types.WalletTxDetails, out *WalletTxDetails
 }
 
 // DecodeTx docode transaction
-func DecodeTx(tx *types.Transaction) (*Transaction, error) {
+func DecodeTx(tx *types.Transaction, coinPrecision int64) (*Transaction, error) {
 	if tx == nil {
 		return nil, types.ErrEmpty
 	}
@@ -100,7 +105,7 @@ func DecodeTx(tx *types.Transaction) (*Transaction, error) {
 			pl = nil
 		}
 	}
-	if string(tx.Execer) == "user.write" {
+	if strings.HasSuffix(string(tx.Execer), "user.write") {
 		pl = decodeUserWrite(tx.GetPayload())
 	}
 	var pljson json.RawMessage
@@ -125,11 +130,9 @@ func DecodeTx(tx *types.Transaction) (*Transaction, error) {
 		Header:     common.ToHex(tx.Header),
 		Next:       common.ToHex(tx.Next),
 		Hash:       common.ToHex(tx.Hash()),
+		ChainID:    tx.ChainID,
 	}
-	if result.Amount != 0 {
-		result.AmountFmt = strconv.FormatFloat(float64(result.Amount)/float64(types.Coin), 'f', 4, 64)
-	}
-	feeResult := strconv.FormatFloat(float64(tx.Fee)/float64(types.Coin), 'f', 4, 64)
+	feeResult := types.FormatAmount2FloatDisplay(tx.Fee, coinPrecision, true)
 	result.FeeFmt = feeResult
 	return result, nil
 }

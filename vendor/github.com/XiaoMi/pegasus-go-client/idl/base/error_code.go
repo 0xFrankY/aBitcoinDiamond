@@ -3,13 +3,20 @@ package base
 import (
 	"fmt"
 
-	"github.com/apache/thrift/lib/go/thrift"
+	"github.com/pegasus-kv/thrift/lib/go/thrift"
 )
 
 /// Primitive for Pegasus thrift framework.
 type ErrorCode struct {
 	Errno string
 }
+
+// How to generate the map from string to error codes?
+// First:
+//  - go get github.com/alvaroloes/enumer
+// Second:
+//  - cd idl/base
+//  - enumer -type=DsnErrCode -output=dsn_err_string.go
 
 //go:generate enumer -type=DsnErrCode -output=err_type_string.go
 type DsnErrCode int32
@@ -71,23 +78,27 @@ const (
 	ERR_TRY_AGAIN
 	ERR_CLUSTER_NOT_FOUND
 	ERR_CLUSTER_ALREADY_EXIST
+	ERR_SERVICE_ALREADY_EXIST
+	ERR_INJECTED
+	ERR_NETWORK_FAILURE
+	ERR_UNDER_RECOVERY
+	ERR_OPERATION_DISABLED
 	ERR_ZOOKEEPER_OPERATION
-	ERR_K8S_CLUSTER_NOT_FOUND
-	ERR_K8S_KUBECTL_NOT_FOUND
-	ERR_K8S_DEPLOY_FAILED
-	ERR_K8S_UNDEPLOY_FAILED
-	ERR_RESOURCE_NOT_ENOUGH
-	ERR_WIN_DEPLOY_FAILED
-	ERR_WIN_UNDEPLOY_FAILED
-	ERR_DOCKER_DAEMON_NOT_FOUND
-	ERR_DOCKER_BINARY_NOT_FOUND
-	ERR_DOCKER_DEPLOY_FAILED
-	ERR_DOCKER_UNDEPLOY_FAILED
-	ERR_FS_INTERNAL
+	ERR_CHILD_REGISTERED
+	ERR_INGESTION_FAILED
+	ERR_UNAUTHENTICATED
+	ERR_KRB5_INTERNAL
+	ERR_SASL_INTERNAL
+	ERR_SASL_INCOMPLETE
+	ERR_ACL_DENY
+	ERR_SPLITTING
+	ERR_PARENT_PARTITION_MISUSED
+	ERR_CHILD_NOT_READY
+	ERR_DISK_INSUFFICIENT
 )
 
 func (e DsnErrCode) Error() string {
-	return fmt.Sprintf("DSN_ERR(%s)", e.String())
+	return fmt.Sprintf("[%s]", e.String())
 }
 
 func (ec *ErrorCode) Read(iprot thrift.TProtocol) (err error) {

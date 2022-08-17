@@ -8,12 +8,15 @@ package btcbase
 
 import (
 	"crypto/sha256"
+	"fmt"
 
-	"github.com/haltingstate/secp256k1-go"
+	"github.com/33cn/chain33/system/address/btc"
+
+	"github.com/33cn/chain33/common/address"
+
+	"github.com/33cn/chain33/common/crypto"
 	"github.com/mr-tron/base58/base58"
 	"golang.org/x/crypto/ripemd160"
-
-	"fmt"
 )
 
 // btcBaseTransformer 转换基于比特币地址规则的币种实现类
@@ -36,13 +39,22 @@ func (t btcBaseTransformer) ByteToBase58(bin []byte) (str string) {
 //TODO: 根据私钥类型进行判断，选择输出压缩或非压缩公钥
 
 // PrivKeyToPub 32字节私钥生成压缩格式公钥
-func (t btcBaseTransformer) PrivKeyToPub(priv []byte) (pub []byte, err error) {
-	if len(priv) != 32 {
+func (t btcBaseTransformer) PrivKeyToPub(keyTy uint32, priv []byte) (pub []byte, err error) {
+	if len(priv) != 32 && len(priv) != 64 {
 		return nil, fmt.Errorf("invalid priv key byte")
 	}
-	pub = secp256k1.PubkeyFromSeckey(priv)
-	// uncompressPub := secp256k1.UncompressPubkey(pub)
-	return
+	//pub = secp256k1.PubkeyFromSeckey(priv)
+
+	edcrypto, err := crypto.Load(crypto.GetName(int(keyTy)), -1)
+	if err != nil {
+		return nil, err
+	}
+	edkey, err := edcrypto.PrivKeyFromBytes(priv[:])
+	if err != nil {
+		return nil, err
+	}
+	return edkey.PubKey().Bytes(), nil
+
 }
 
 //checksum: first four bytes of double-SHA256.
@@ -67,7 +79,8 @@ func checksum(input []byte) (cksum [4]byte) {
 //（压缩和非压缩形式的公钥生成的地址是不同的，但都是合法的）
 func (t btcBaseTransformer) PubKeyToAddress(pub []byte) (addr string, err error) {
 	if len(pub) != 33 && len(pub) != 65 { //压缩格式 与 非压缩格式
-		return "", fmt.Errorf("invalid public key byte")
+		//return "", fmt.Errorf("invalid public key byte:%v", len(pub))
+		return btc.FormatBtcAddr(address.NormalVer, pub), nil
 	}
 
 	sha256h := sha256.New()

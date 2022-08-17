@@ -7,7 +7,6 @@ package executor
 import (
 	"fmt"
 
-	"github.com/33cn/chain33/common/address"
 	"github.com/33cn/chain33/types"
 )
 
@@ -20,7 +19,7 @@ type txindexPlugin struct {
 }
 
 func (p *txindexPlugin) CheckEnable(executor *executor, enable bool) (kvs []*types.KeyValue, ok bool, err error) {
-	return nil, true, nil
+	return nil, enable, nil
 }
 
 func (p *txindexPlugin) ExecLocal(executor *executor, data *types.BlockDetail) (kvs []*types.KeyValue, err error) {
@@ -49,6 +48,8 @@ func (p *txindexPlugin) ExecDelLocal(executor *executor, data *types.BlockDetail
 
 //获取公共的信息
 func getTx(executor *executor, tx *types.Transaction, receipt *types.ReceiptData, index int) []*types.KeyValue {
+	types.AssertConfig(executor.api)
+	cfg := executor.api.GetConfig()
 	txhash := tx.Hash()
 	//构造txresult 信息保存到db中
 	var txresult types.TxResult
@@ -59,8 +60,8 @@ func getTx(executor *executor, tx *types.Transaction, receipt *types.ReceiptData
 	txresult.Blocktime = executor.blocktime
 	txresult.ActionName = tx.ActionName()
 	var kvlist []*types.KeyValue
-	kvlist = append(kvlist, &types.KeyValue{Key: types.CalcTxKey(txhash), Value: types.Encode(&txresult)})
-	if types.IsEnable("quickIndex") {
+	kvlist = append(kvlist, &types.KeyValue{Key: cfg.CalcTxKey(txhash), Value: cfg.CalcTxKeyValue(&txresult)})
+	if cfg.IsEnable("quickIndex") {
 		kvlist = append(kvlist, &types.KeyValue{Key: types.CalcTxShortKey(txhash), Value: []byte("1")})
 	}
 	return kvlist
@@ -86,7 +87,7 @@ func getTxIndex(executor *executor, tx *types.Transaction, receipt *types.Receip
 		var err error
 		txinf.Assets, err = ety.GetAssets(tx)
 		if err != nil {
-			elog.Error("getTxIndex ", "GetAssets err", err)
+			elog.Debug("getTxIndex ", "GetAssets err", err)
 		}
 	}
 
@@ -94,7 +95,7 @@ func getTxIndex(executor *executor, tx *types.Transaction, receipt *types.Receip
 	heightstr := fmt.Sprintf("%018d", executor.height*types.MaxTxsPerBlock+int64(index))
 	txIndexInfo.heightstr = heightstr
 
-	txIndexInfo.from = address.PubKeyToAddress(tx.GetSignature().GetPubkey()).String()
+	txIndexInfo.from = tx.From()
 	txIndexInfo.to = tx.GetRealToAddr()
 	return &txIndexInfo
 }

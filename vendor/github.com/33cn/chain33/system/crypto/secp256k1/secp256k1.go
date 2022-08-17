@@ -11,7 +11,7 @@ import (
 	"fmt"
 
 	"github.com/33cn/chain33/common/crypto"
-	secp256k1 "github.com/aBitcoinDiamond/btcec"
+	secp256k1 "github.com/btcsuite/btcd/btcec"
 )
 
 //Driver 驱动
@@ -51,6 +51,11 @@ func (d Driver) PubKeyFromBytes(b []byte) (pubKey crypto.PubKey, err error) {
 //SignatureFromBytes 字节转为签名
 func (d Driver) SignatureFromBytes(b []byte) (sig crypto.Signature, err error) {
 	return SignatureSecp256k1(b), nil
+}
+
+// Validate validate msg and signature
+func (d Driver) Validate(msg, pub, sig []byte) error {
+	return crypto.BasicValidation(d, msg, pub, sig)
 }
 
 //PrivKeySecp256k1 PrivKey
@@ -190,6 +195,5 @@ const (
 )
 
 func init() {
-	crypto.Register(Name, &Driver{})
-	crypto.RegisterType(Name, ID)
+	crypto.Register(Name, &Driver{}, crypto.WithRegOptionTypeID(ID))
 }

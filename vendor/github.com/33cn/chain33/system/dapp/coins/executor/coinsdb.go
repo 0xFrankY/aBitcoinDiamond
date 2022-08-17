@@ -18,13 +18,15 @@ EventTransfer -> 转移资产
 import (
 	"fmt"
 
+	"github.com/33cn/chain33/common/address"
+
 	dbm "github.com/33cn/chain33/common/db"
 	"github.com/33cn/chain33/types"
 )
 
 // calcAddrKey store information on the receiving address
 func calcAddrKey(addr string) []byte {
-	return []byte(fmt.Sprintf("LODB-coins-Addr:%s", addr))
+	return []byte(fmt.Sprintf("LODB-coins-Addr:%s", address.FormatAddrKey(addr)))
 }
 
 func geAddrReciverKV(addr string, reciverAmount int64) *types.KeyValue {
@@ -56,6 +58,9 @@ func setAddrReciver(db dbm.KVDB, addr string, reciverAmount int64) error {
 }
 
 func updateAddrReciver(cachedb dbm.KVDB, addr string, amount int64, isadd bool) (*types.KeyValue, error) {
+	if subCfg.DisableAddrReceiver {
+		return nil, types.ErrActionNotSupport
+	}
 	recv, err := getAddrReciver(cachedb, addr)
 	if err != nil && err != types.ErrNotFound {
 		return nil, err

@@ -6,13 +6,13 @@ package session
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	"github.com/XiaoMi/pegasus-go-client/idl/base"
 	"github.com/XiaoMi/pegasus-go-client/idl/replication"
 	"github.com/XiaoMi/pegasus-go-client/idl/rrdb"
 	"github.com/XiaoMi/pegasus-go-client/pegalog"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
 )
 
 // metaSession represents the network session between client and meta server.
@@ -23,16 +23,17 @@ type metaSession struct {
 }
 
 func (ms *metaSession) call(ctx context.Context, args RpcRequestArgs, rpcName string) (RpcResponseResult, error) {
-	return ms.CallWithGpid(ctx, &base.Gpid{0, 0}, args, rpcName)
+	return ms.CallWithGpid(ctx, &base.Gpid{Appid: 0, PartitionIndex: 0}, 0, args, rpcName)
 }
 
 func (ms *metaSession) queryConfig(ctx context.Context, tableName string) (*replication.QueryCfgResponse, error) {
+	ms.logger.Printf("querying configuration of table(%s) from %s", tableName, ms)
+
 	arg := rrdb.NewMetaQueryCfgArgs()
 	arg.Query = replication.NewQueryCfgRequest()
 	arg.Query.AppName = tableName
 	arg.Query.PartitionIndices = []int32{}
 
-	ms.logger.Printf("querying configuration of table(%s) from %s", tableName, ms)
 	result, err := ms.call(ctx, arg, "RPC_CM_QUERY_PARTITION_CONFIG_BY_INDEX")
 	if err != nil {
 		ms.logger.Printf("failed to query configuration from %s: %s", ms, err)
@@ -43,11 +44,12 @@ func (ms *metaSession) queryConfig(ctx context.Context, tableName string) (*repl
 	return ret.GetSuccess(), nil
 }
 
-// MetaManager manages the list of metas, but only the leader will it requests to.
+// MetaManager manages the list of metas, but only the leader will it request to.
 // If the one is not the actual leader, it will retry with another.
 type MetaManager struct {
 	logger pegalog.Logger
 
+	metaIPAddrs   []string
 	metas         []*metaSession
 	currentLeader int // current leader of meta servers
 
@@ -58,62 +60,47 @@ type MetaManager struct {
 //
 func NewMetaManager(addrs []string, creator NodeSessionCreator) *MetaManager {
 	metas := make([]*metaSession, len(addrs))
+	metaIPAddrs := make([]string, len(addrs))
 	for i, addr := range addrs {
 		metas[i] = &metaSession{
 			NodeSession: creator(addr, NodeTypeMeta),
 			logger:      pegalog.GetLogger(),
 		}
+		metaIPAddrs[i] = addr
 	}
 
 	mm := &MetaManager{
 		currentLeader: 0,
 		metas:         metas,
+		metaIPAddrs:   metaIPAddrs,
 		logger:        pegalog.GetLogger(),
 	}
 	return mm
 }
 
+func (m *MetaManager) call(ctx context.Context, callFunc metaCallFunc) (metaResponse, error) {
+	lead := m.getCurrentLeader()
+	call := newMetaCall(lead, m.metas, callFunc)
+	resp, err := call.Run(ctx)
+	if err == nil {
+		m.setCurrentLeader(int(call.newLead))
+	}
+	return resp, err
+}
+
+// QueryConfig queries table configuration from the leader of meta servers. If the leader was changed,
+// it retries for other servers until it finds the true leader, unless no leader exists.
 // Thread-Safe
 func (m *MetaManager) QueryConfig(ctx context.Context, tableName string) (*replication.QueryCfgResponse, error) {
-	lead := m.getCurrentLeader()
-	meta := m.metas[lead]
-	resp, err := meta.queryConfig(ctx, tableName)
-
-	if ctx.Err() != nil {
-		// if the error was due to context death, exit.
-		return nil, ctx.Err()
+	m.logger.Printf("querying configuration of table(%s) [metaList=%s]", tableName, m.metaIPAddrs)
+	resp, err := m.call(ctx, func(rpcCtx context.Context, ms *metaSession) (metaResponse, error) {
+		return ms.queryConfig(rpcCtx, tableName)
+	})
+	if err == nil {
+		queryCfgResp := resp.(*replication.QueryCfgResponse)
+		return queryCfgResp, nil
 	}
-	if err != nil || resp.Err.Errno == base.ERR_FORWARD_TO_OTHERS.String() {
-		excluded := lead
-
-		// try other nodes, if finally we are unable to find any node that's
-		// available, we will give up and return error.
-		for i, meta := range m.metas {
-			if i == excluded {
-				continue
-			}
-
-			resp, err = meta.queryConfig(ctx, tableName)
-			if ctx.Err() != nil {
-				// exit if the context was cancelled
-				return nil, ctx.Err()
-			}
-			if err != nil || resp.Err.Errno == base.ERR_FORWARD_TO_OTHERS.String() {
-				continue
-			}
-
-			m.setCurrentLeader(i)
-			return resp, nil
-		}
-
-		// when all the responses are ERR_FORWARD_TO_OTHERS
-		if err == nil {
-			err = fmt.Errorf("unable to find the leader of meta servers")
-		}
-		return nil, err
-	} else {
-		return resp, nil
-	}
+	return nil, err
 }
 
 func (m *MetaManager) getCurrentLeader() int {
@@ -130,11 +117,14 @@ func (m *MetaManager) setCurrentLeader(lead int) {
 	m.currentLeader = lead
 }
 
+// Close the sessions.
 func (m *MetaManager) Close() error {
-	for _, ns := range m.metas {
-		if err := ns.Close(); err != nil {
-			return err
+	funcs := make([]func() error, len(m.metas))
+	for i := 0; i < len(m.metas); i++ {
+		idx := i
+		funcs[idx] = func() error {
+			return m.metas[idx].Close()
 		}
 	}
-	return nil
+	return kerrors.AggregateGoroutines(funcs...)
 }

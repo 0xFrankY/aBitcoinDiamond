@@ -12,6 +12,9 @@ import (
 	"strings"
 	"unicode"
 
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
+
 	"github.com/33cn/chain33/common/address"
 	"github.com/golang/protobuf/proto"
 )
@@ -86,7 +89,7 @@ func LoadExecutorType(execstr string) ExecutorType {
 }
 
 // CallExecNewTx 重构完成后删除
-func CallExecNewTx(execName, action string, param interface{}) ([]byte, error) {
+func CallExecNewTx(c *Chain33Config, execName, action string, param interface{}) ([]byte, error) {
 	exec := LoadExecutorType(execName)
 	if exec == nil {
 		tlog.Error("callExecNewTx", "Error", "exec not found")
@@ -107,7 +110,7 @@ func CallExecNewTx(execName, action string, param interface{}) ([]byte, error) {
 		tlog.Error("callExecNewTx", "Error", err)
 		return nil, err
 	}
-	return FormatTxEncode(execName, tx)
+	return FormatTxEncode(c, execName, tx)
 }
 
 //CallCreateTransaction 创建一个交易
@@ -126,23 +129,23 @@ func CallCreateTransaction(execName, action string, param Message) (*Transaction
 }
 
 // CallCreateTx 构造交易信息
-func CallCreateTx(execName, action string, param Message) ([]byte, error) {
+func CallCreateTx(c *Chain33Config, execName, action string, param Message) ([]byte, error) {
 	tx, err := CallCreateTransaction(execName, action, param)
 	if err != nil {
 		return nil, err
 	}
-	return FormatTxEncode(execName, tx)
+	return FormatTxEncode(c, execName, tx)
 }
 
 //CallCreateTxJSON create tx by json
-func CallCreateTxJSON(execName, action string, param json.RawMessage) ([]byte, error) {
+func CallCreateTxJSON(c *Chain33Config, execName, action string, param json.RawMessage) ([]byte, error) {
 	exec := LoadExecutorType(execName)
 	if exec == nil {
 		execer := GetParaExecName([]byte(execName))
 		//找不到执行器，并且是user.xxx 的情况下
 		if bytes.HasPrefix(execer, UserKey) {
 			tx := &Transaction{Payload: param}
-			return FormatTxEncode(execName, tx)
+			return FormatTxEncode(c, execName, tx)
 		}
 		tlog.Error("CallCreateTxJSON", "Error", "exec not found")
 		return nil, ErrExecNotFound
@@ -157,28 +160,49 @@ func CallCreateTxJSON(execName, action string, param json.RawMessage) ([]byte, e
 		tlog.Error("CallCreateTxJSON", "Error", err)
 		return nil, err
 	}
-	return FormatTxEncode(execName, tx)
+	return FormatTxEncode(c, execName, tx)
 }
 
 // CreateFormatTx 构造交易信息
-func CreateFormatTx(execName string, payload []byte) (*Transaction, error) {
+func CreateFormatTx(c *Chain33Config, execName string, payload []byte) (*Transaction, error) {
 	//填写nonce,execer,to, fee 等信息, 后面会增加一个修改transaction的函数，会加上execer fee 等的修改
 	tx := &Transaction{Payload: payload}
-	return FormatTx(execName, tx)
+	return FormatTx(c, execName, tx)
 }
 
 // FormatTx 格式化tx交易
-func FormatTx(execName string, tx *Transaction) (*Transaction, error) {
+func FormatTx(c *Chain33Config, execName string, tx *Transaction) (*Transaction, error) {
 	//填写nonce,execer,to, fee 等信息, 后面会增加一个修改transaction的函数，会加上execer fee 等的修改
 	tx.Nonce = rand.Int63()
+	tx.ChainID = c.GetChainID()
 	tx.Execer = []byte(execName)
 	//平行链，所有的to地址都是合约地址
-	if IsPara() || tx.To == "" {
+	if c.IsPara() || tx.To == "" {
 		tx.To = address.ExecAddress(string(tx.Execer))
 	}
 	var err error
 	if tx.Fee == 0 {
-		tx.Fee, err = tx.GetRealFee(GInt("MinFee"))
+		tx.Fee, err = tx.GetRealFee(c.GetMinTxFeeRate())
+		if err != nil {
+			return nil, err
+		}
+	}
+	return tx, nil
+}
+
+//FormatTxExt 根据输入参数格式化tx
+func FormatTxExt(chainID int32, isPara bool, minFee int64, execName string, tx *Transaction) (*Transaction, error) {
+	//填写nonce,execer,to, fee 等信息, 后面会增加一个修改transaction的函数，会加上execer fee 等的修改
+	tx.Nonce = rand.Int63()
+	tx.ChainID = chainID
+	tx.Execer = []byte(execName)
+	//平行链，所有的to地址都是合约地址
+	if isPara || tx.To == "" {
+		tx.To = address.ExecAddress(string(tx.Execer))
+	}
+	var err error
+	if tx.Fee == 0 {
+		tx.Fee, err = tx.GetRealFee(minFee)
 		if err != nil {
 			return nil, err
 		}
@@ -187,8 +211,8 @@ func FormatTx(execName string, tx *Transaction) (*Transaction, error) {
 }
 
 // FormatTxEncode 对交易信息编码成byte类型
-func FormatTxEncode(execName string, tx *Transaction) ([]byte, error) {
-	tx, err := FormatTx(execName, tx)
+func FormatTxEncode(c *Chain33Config, execName string, tx *Transaction) ([]byte, error) {
+	tx, err := FormatTx(c, execName, tx)
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +306,6 @@ type ExecutorType interface {
 	IsFork(height int64, key string) bool
 	//actionType -> name map
 	GetTypeMap() map[string]int32
-	GetValueTypeMap() map[string]reflect.Type
 	//action function list map
 	GetFuncMap() map[string]reflect.Method
 	GetRPCFuncMap() map[string]reflect.Method
@@ -290,6 +313,10 @@ type ExecutorType interface {
 	CreateTransaction(action string, data Message) (*Transaction, error)
 	// collect assets the tx deal with
 	GetAssets(tx *Transaction) ([]*Asset, error)
+
+	// about chain33Config
+	GetConfig() *Chain33Config
+	SetConfig(cfg *Chain33Config)
 }
 
 // ExecTypeGet  获取类型值
@@ -299,14 +326,18 @@ type execTypeGet interface {
 
 // ExecTypeBase  执行类型
 type ExecTypeBase struct {
-	child               ExecutorType
-	childValue          reflect.Value
-	actionFunList       map[string]reflect.Method
-	execFuncList        map[string]reflect.Method
-	actionListValueType map[string]reflect.Type
-	rpclist             map[string]reflect.Method
-	queryMap            map[string]reflect.Type
-	forks               *Forks
+	child         ExecutorType
+	childValue    reflect.Value
+	actionFunList map[string]reflect.Method
+	execFuncList  map[string]reflect.Method
+	//actionListValueType    map[string]reflect.Type
+	rpclist                map[string]reflect.Method
+	queryMap               map[string]reflect.Type
+	forks                  *Forks
+	cfg                    *Chain33Config
+	actionMsgDescriptor    protoreflect.MessageDescriptor
+	fieldName              map[string]protoreflect.Name
+	actionFieldDescriptors protoreflect.FieldDescriptors
 }
 
 // GetChild  获取子执行器
@@ -319,8 +350,8 @@ func (base *ExecTypeBase) SetChild(child ExecutorType) {
 	base.child = child
 	base.childValue = reflect.ValueOf(child)
 	base.rpclist = ListMethod(child)
-	base.actionListValueType = make(map[string]reflect.Type)
 	base.actionFunList = make(map[string]reflect.Method)
+	base.fieldName = make(map[string]protoreflect.Name)
 	base.forks = child.GetForks()
 
 	action := child.GetPayload()
@@ -328,35 +359,25 @@ func (base *ExecTypeBase) SetChild(child ExecutorType) {
 		return
 	}
 	base.actionFunList = ListMethod(action)
-	if _, ok := base.actionFunList["XXX_OneofFuncs"]; !ok {
+	actionDescriptor := proto.MessageV2(action).ProtoReflect().Descriptor()
+	// 合约action不存在oneof类型, 不支持反射构造交易
+	if actionDescriptor.Oneofs().Len() <= 0 {
 		return
 	}
-	retval := base.actionFunList["XXX_OneofFuncs"].Func.Call([]reflect.Value{reflect.ValueOf(action)})
-	if len(retval) != 4 {
-		panic("err XXX_OneofFuncs")
-	}
-	list := ListType(retval[3].Interface().([]interface{}))
+	base.actionMsgDescriptor = actionDescriptor
+	base.actionFieldDescriptors = actionDescriptor.Fields()
 
-	for k, v := range list {
-		data := strings.Split(k, "_")
-		if len(data) != 2 {
-			panic("name create " + k)
-		}
-		base.actionListValueType["Value_"+data[1]] = v
-		field := v.Field(0)
-		base.actionListValueType[field.Name] = field.Type.Elem()
-		_, ok := v.FieldByName(data[1])
-		if !ok {
-			panic("no filed " + k)
-		}
+	// field名称是字段tag名称
+	for i := 0; i < base.actionFieldDescriptors.Len(); i++ {
+		field := base.actionFieldDescriptors.Get(i)
+		base.setActionFieldName(field.Name())
 	}
+
 	//check type map is all in value type list
 	typelist := base.child.GetTypeMap()
 	for k := range typelist {
-		if _, ok := base.actionListValueType[k]; !ok {
-			panic("value type not found " + k)
-		}
-		if _, ok := base.actionListValueType["Value_"+k]; !ok {
+		fieldName := base.getActionFieldName(k)
+		if base.actionFieldDescriptors.ByName(fieldName) == nil {
 			panic("value type not found " + k)
 		}
 	}
@@ -408,17 +429,12 @@ func (base *ExecTypeBase) IsFork(height int64, key string) bool {
 	if base.GetForks() == nil {
 		return false
 	}
-	return base.forks.IsFork(GetTitle(), height, key)
-}
-
-// GetValueTypeMap  获取执行函数
-func (base *ExecTypeBase) GetValueTypeMap() map[string]reflect.Type {
-	return base.actionListValueType
+	return base.forks.IsFork(height, key)
 }
 
 //GetRealToAddr 用户看到的ToAddr
 func (base *ExecTypeBase) GetRealToAddr(tx *Transaction) string {
-	if !IsPara() {
+	if !base.cfg.IsPara() {
 		return tx.To
 	}
 	//平行链中的处理方式
@@ -518,7 +534,8 @@ func (base *ExecTypeBase) decodePayloadValue(tx *Transaction) (string, reflect.V
 	}
 	action, err := base.child.DecodePayload(tx)
 	if err != nil || action == nil {
-		tlog.Error("DecodePayload", "err", err, "exec", string(tx.Execer))
+		// 目前存证交易会解析失败, 这个错误不会影响
+		tlog.Debug("DecodePayload", "err", err, "exec", string(tx.Execer))
 		return "", nilValue, err
 	}
 	name, ty, val, err := GetActionValue(action, base.child.GetFuncMap())
@@ -669,13 +686,14 @@ func (base *ExecTypeBase) Create(action string, msg Message) (*Transaction, erro
 		return nil, ErrInvalidParam
 	}
 	typemap := base.child.GetTypeMap()
-	if _, ok := typemap[action]; ok {
-		ty1 := base.actionListValueType[action]
-		ty2 := reflect.TypeOf(msg).Elem()
-		if ty1 != ty2 {
+	fieldName := base.getActionFieldName(action)
+	if _, ok := typemap[action]; ok && fieldName != "" {
+		fieldDes := base.actionFieldDescriptors.ByName(fieldName)
+		// 判断msg结构名称是否一致
+		if fieldDes.Message().FullName() != proto.MessageV2(msg).ProtoReflect().Descriptor().FullName() {
 			return nil, ErrInvalidParam
 		}
-		return base.CreateTransaction(action, msg.(Message))
+		return base.CreateTransaction(action, msg)
 	}
 	tlog.Error(action + " ErrActionNotSupport")
 	return nil, ErrActionNotSupport
@@ -684,18 +702,9 @@ func (base *ExecTypeBase) Create(action string, msg Message) (*Transaction, erro
 //GetAction 获取action
 func (base *ExecTypeBase) GetAction(action string) (Message, error) {
 	typemap := base.child.GetTypeMap()
-	if _, ok := typemap[action]; ok {
-		tyvalue := reflect.New(base.actionListValueType[action])
-		if !tyvalue.CanInterface() {
-			tlog.Error(action + " tyvalue.CanInterface error")
-			return nil, ErrActionNotSupport
-		}
-		data, ok := tyvalue.Interface().(Message)
-		if !ok {
-			tlog.Error(action + " tyvalue is not Message")
-			return nil, ErrActionNotSupport
-		}
-		return data, nil
+	fieldName := base.getActionFieldName(action)
+	if _, ok := typemap[action]; ok && fieldName != "" {
+		return dynamicpb.NewMessage(base.actionFieldDescriptors.ByName(fieldName).Message()), nil
 	}
 	tlog.Error(action + " ErrActionNotSupport")
 	return nil, ErrActionNotSupport
@@ -720,6 +729,15 @@ func (base *ExecTypeBase) CreateTx(action string, msg json.RawMessage) (*Transac
 	return base.CreateTransaction(action, data)
 }
 
+func (base *ExecTypeBase) getActionFieldName(action string) protoreflect.Name {
+	return base.fieldName[strings.ToLower(action)]
+}
+
+func (base *ExecTypeBase) setActionFieldName(name protoreflect.Name) {
+	base.fieldName[strings.ToLower(string(name))] = name
+
+}
+
 //CreateTransaction 构造Transaction
 func (base *ExecTypeBase) CreateTransaction(action string, data Message) (tx *Transaction, err error) {
 	defer func() {
@@ -727,39 +745,28 @@ func (base *ExecTypeBase) CreateTransaction(action string, data Message) (tx *Tr
 			err = ErrActionNotSupport
 		}
 	}()
-	value := base.child.GetPayload()
-	v := reflect.New(base.actionListValueType["Value_"+action])
-	vn := reflect.Indirect(v)
-	if vn.Kind() != reflect.Struct {
-		tlog.Error("CreateTransaction vn not struct kind", "exectutor", base.child.GetName(), "action", action)
+	if base.actionFieldDescriptors == nil {
 		return nil, ErrActionNotSupport
 	}
-	field := vn.FieldByName(action)
-	if !field.IsValid() || !field.CanSet() {
-		tlog.Error("CreateTransaction vn filed can't set", "exectutor", base.child.GetName(), "action", action)
-		return nil, ErrActionNotSupport
+	// 兼容protobuf不同版本msg, 统一使用反射类型
+	if _, ok := data.(*dynamicpb.Message); !ok {
+		fieldName := base.getActionFieldName(action)
+		msg := dynamicpb.NewMessage(base.actionFieldDescriptors.ByName(fieldName).Message())
+		proto.Merge(msg, data)
+		data = msg
 	}
-	field.Set(reflect.ValueOf(data))
-	value2 := reflect.Indirect(reflect.ValueOf(value))
-	if value2.Kind() != reflect.Struct {
-		tlog.Error("CreateTransaction value2 not struct kind", "exectutor", base.child.GetName(), "action", action)
-		return nil, ErrActionNotSupport
-	}
-	field = value2.FieldByName("Value")
-	if !field.IsValid() || !field.CanSet() {
-		tlog.Error("CreateTransaction value filed can't set", "exectutor", base.child.GetName(), "action", action)
-		return nil, ErrActionNotSupport
-	}
-	field.Set(v)
 
-	field = value2.FieldByName("Ty")
-	if !field.IsValid() || !field.CanSet() {
-		tlog.Error("CreateTransaction ty filed can't set", "exectutor", base.child.GetName(), "action", action)
+	value := dynamicpb.NewMessage(base.actionMsgDescriptor)
+	fieldName := base.getActionFieldName(action)
+	value.Set(base.actionFieldDescriptors.ByName(fieldName), protoreflect.ValueOf(data))
+
+	tyField := base.actionFieldDescriptors.ByName(base.getActionFieldName("ty"))
+	if tyField == nil {
+		tlog.Error("CreateTransaction ty filed not exist", "exectutor", base.child.GetName(), "action", action)
 		return nil, ErrActionNotSupport
 	}
-	tymap := base.child.GetTypeMap()
-	if tyid, ok := tymap[action]; ok {
-		field.Set(reflect.ValueOf(tyid))
+	if ty, ok := base.child.GetTypeMap()[action]; ok {
+		value.Set(tyField, protoreflect.ValueOfInt32(ty))
 		tx := &Transaction{
 			Payload: Encode(value),
 		}
@@ -791,4 +798,14 @@ func (base *ExecTypeBase) GetAssets(tx *Transaction) ([]*Asset, error) {
 	}
 	asset.Amount = amount
 	return []*Asset{asset}, nil
+}
+
+//GetConfig ...
+func (base *ExecTypeBase) GetConfig() *Chain33Config {
+	return base.cfg
+}
+
+//SetConfig ...
+func (base *ExecTypeBase) SetConfig(cfg *Chain33Config) {
+	base.cfg = cfg
 }

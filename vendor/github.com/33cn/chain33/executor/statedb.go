@@ -14,8 +14,8 @@ import (
 
 // StateDB state db for store mavl
 type StateDB struct {
-	cache     map[string][]byte
-	txcache   map[string][]byte
+	cache     *cacheDB
+	txcache   *cacheDB
 	keys      []string
 	intx      bool
 	client    queue.Client
@@ -38,8 +38,10 @@ func NewStateDB(client queue.Client, stateHash []byte, localdb db.KVDB, opt *Sta
 		opt = &StateDBOption{}
 	}
 	db := &StateDB{
-		cache:     make(map[string][]byte),
-		txcache:   make(map[string][]byte),
+		//预分配一个单位
+		cache:     newcacheDB(1024),
+		txcache:   newcacheDB(32),
+		keys:      make([]string, 0, 32),
 		intx:      false,
 		client:    client,
 		stateHash: stateHash,
@@ -70,9 +72,11 @@ func (s *StateDB) enableMVCC(hash []byte) {
 // Begin 开启内存事务处理
 func (s *StateDB) Begin() {
 	s.intx = true
-	s.keys = nil
-	if types.IsFork(s.height, "ForkExecRollback") {
-		s.txcache = nil
+	s.keys = s.keys[:0]
+	types.AssertConfig(s.client)
+	cfg := s.client.GetConfig()
+	if cfg.IsFork(s.height, "ForkExecRollback") {
+		s.txcache.Reset()
 	}
 }
 
@@ -83,12 +87,12 @@ func (s *StateDB) Rollback() {
 
 // Commit canche tx
 func (s *StateDB) Commit() error {
-	for k, v := range s.txcache {
-		s.cache[k] = v
-	}
+	s.cache.Merge(s.txcache)
 	s.intx = false
-	s.keys = nil
-	if types.IsFork(s.height, "ForkExecRollback") {
+	s.keys = s.keys[:0]
+	types.AssertConfig(s.client)
+	cfg := s.client.GetConfig()
+	if cfg.IsFork(s.height, "ForkExecRollback") {
 		s.resetTx()
 	}
 	return nil
@@ -96,26 +100,26 @@ func (s *StateDB) Commit() error {
 
 func (s *StateDB) resetTx() {
 	s.intx = false
-	s.txcache = nil
-	s.keys = nil
+	s.txcache.Reset()
+	s.keys = s.keys[:0]
 }
 
 // Get get value from state db
 func (s *StateDB) Get(key []byte) ([]byte, error) {
 	v, err := s.get(key)
-	debugAccount("==get==", key, v)
+	//debugAccount("==get==", key, v)
 	return v, err
 }
 
 func (s *StateDB) get(key []byte) ([]byte, error) {
-	skey := string(key)
-	if s.intx && s.txcache != nil {
-		if value, ok := s.txcache[skey]; ok {
-			return value, nil
+
+	if s.intx {
+		if value, exist, err := s.txcache.Get(key); exist {
+			return value, err
 		}
 	}
-	if value, ok := s.cache[skey]; ok {
-		return value, nil
+	if value, exist, err := s.cache.Get(key); exist {
+		return value, err
 	}
 	//mvcc 是有效的情况下，直接从mvcc中获取
 	if s.version >= 0 {
@@ -136,6 +140,7 @@ func (s *StateDB) get(key []byte) ([]byte, error) {
 	if err != nil {
 		panic(err) //no happen for ever
 	}
+	defer s.client.FreeMessage(msg, resp)
 	if nil == resp.GetData().(*types.StoreReplyValue).Values {
 		return nil, types.ErrNotFound
 	}
@@ -145,27 +150,27 @@ func (s *StateDB) get(key []byte) ([]byte, error) {
 		return nil, types.ErrNotFound
 	}
 	//get 的值可以写入cache，因为没有对系统的值做修改
-	s.cache[skey] = value
+	s.cache.Set(key, value)
 	return value, nil
 }
 
-func debugAccount(prefix string, key []byte, value []byte) {
-	//println(prefix, string(key), string(value))
-	/*
-		if !types.Debug {
-			return
-		}
-		var msg types.Account
-		err := types.Decode(value, &msg)
-		if err == nil {
-			elog.Info(prefix, "key", string(key), "value", msg)
-		}
-	*/
-}
+//func debugAccount(prefix string, key []byte, value []byte) {
+//println(prefix, string(key), string(value))
+/*
+	if !types.Debug {
+		return
+	}
+	var msg types.Account
+	err := types.Decode(value, &msg)
+	if err == nil {
+		elog.Info(prefix, "key", string(key), "value", msg)
+	}
+*/
+//}
 
 // StartTx reset state db keys
 func (s *StateDB) StartTx() {
-	s.keys = nil
+	s.keys = s.keys[:0]
 }
 
 // GetSetKeys  get state db set keys
@@ -175,26 +180,14 @@ func (s *StateDB) GetSetKeys() (keys []string) {
 
 // Set set key value to state db
 func (s *StateDB) Set(key []byte, value []byte) error {
-	debugAccount("==set==", key, value)
-	skey := string(key)
+	//debugAccount("==set==", key, value)
 	if s.intx {
-		if s.txcache == nil {
-			s.txcache = make(map[string][]byte)
-		}
-		s.keys = append(s.keys, skey)
-		setmap(s.txcache, skey, value)
+		s.keys = append(s.keys, string(key))
+		s.txcache.Set(key, value)
 	} else {
-		setmap(s.cache, skey, value)
+		s.cache.Set(key, value)
 	}
 	return nil
-}
-
-func setmap(data map[string][]byte, key string, value []byte) {
-	if value == nil {
-		delete(data, key)
-		return
-	}
-	data[key] = value
 }
 
 // BatchGet batch get keys from state db

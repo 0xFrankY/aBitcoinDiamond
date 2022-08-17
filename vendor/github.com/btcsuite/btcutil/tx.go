@@ -8,8 +8,8 @@ import (
 	"bytes"
 	"io"
 
-	"github.com/aBitcoinDiamond/chaincfg/chainhash"
-	"github.com/aBitcoinDiamond/wire"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 )
 
 // TxIndexUnknown is the value returned for a transaction index that is unknown.
@@ -70,7 +70,7 @@ func (t *Tx) WitnessHash() *chainhash.Hash {
 // HasWitness on the underlying wire.MsgTx, however it caches the result so
 // subsequent calls are more efficient.
 func (t *Tx) HasWitness() bool {
-	if t.txHashWitness != nil {
+	if t.txHasWitness != nil {
 		return *t.txHasWitness
 	}
 

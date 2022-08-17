@@ -54,6 +54,7 @@ type DB interface {
 	Close()
 	NewBatch(sync bool) Batch
 	BeginTx() (TxKV, error)
+	CompactRange(start, limit []byte) error
 	// For debugging
 	Print()
 	Stats() map[string]string
@@ -91,14 +92,24 @@ type Batch interface {
 	Set(key, value []byte)
 	Delete(key []byte)
 	Write() error
-	ValueSize() int // size of data in the batch
-	ValueLen() int  // amount of data in the batch
-	Reset()         // Reset resets the batch for reuse
+	ValueSize() int            // size of data in the batch
+	ValueLen() int             // amount of data in the batch
+	Reset()                    // Reset resets the batch for reuse
+	UpdateWriteSync(sync bool) // update write sync
+}
+
+// MustWrite must write correct
+func MustWrite(batch Batch) {
+	err := batch.Write()
+	if err != nil {
+		panic(fmt.Sprint("batch write err", err))
+	}
 }
 
 //IteratorSeeker ...
 type IteratorSeeker interface {
 	Rewind() bool
+	// 返回false， 表示系统中没有指定的key，Iterator会指向key附近
 	Seek(key []byte) bool
 	Next() bool
 }
@@ -240,4 +251,9 @@ func (db *BaseDB) Rollback() {
 //BeginTx call panic when BeginTx not rewrite
 func (db *BaseDB) BeginTx() (TxKV, error) {
 	panic("BeginTx not impl")
+}
+
+//CompactRange call panic when CompactRange not rewrite
+func (db *BaseDB) CompactRange(start, limit []byte) error {
+	panic("CompactRange not impl")
 }

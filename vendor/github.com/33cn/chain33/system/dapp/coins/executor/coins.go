@@ -17,24 +17,36 @@ EventTransfer -> 转移资产
 // nofee transaction will not pack into block
 
 import (
+	"github.com/33cn/chain33/common/log"
 	drivers "github.com/33cn/chain33/system/dapp"
 	"github.com/33cn/chain33/types"
 )
 
-// var clog = log.New("module", "execs.coins")
+var clog = log.New("module", "execs.coins")
 var driverName = "coins"
 
+type subConfig struct {
+	DisableAddrReceiver  bool `json:"disableAddrReceiver"`
+	DisableCheckTxAmount bool `json:"disableCheckTxAmount"`
+}
+
+var subCfg subConfig
+
 // Init defines a register function
-func Init(name string, sub []byte) {
+func Init(name string, cfg *types.Chain33Config, sub []byte) {
 	if name != driverName {
 		panic("system dapp can't be rename")
 	}
-	drivers.Register(driverName, newCoins, types.GetDappFork(driverName, "Enable"))
+	if sub != nil {
+		types.MustDecode(sub, &subCfg)
+	}
+	// 需要先 RegisterDappFork才可以Register dapp
+	drivers.Register(cfg, driverName, newCoins, cfg.GetDappFork(driverName, "Enable"))
+	InitExecType()
 }
 
-// the initialization process is relatively heavyweight, lots of reflact, so it's global
-
-func init() {
+//InitExecType the initialization process is relatively heavyweight, lots of reflect, so it's global
+func InitExecType() {
 	ety := types.LoadExecutorType(driverName)
 	ety.InitFuncList(types.ListMethod(&Coins{}))
 }
@@ -63,13 +75,17 @@ func (c *Coins) GetDriverName() string {
 
 // CheckTx check transaction amount 必须不能为负数
 func (c *Coins) CheckTx(tx *types.Transaction, index int) error {
-	ety := c.GetExecutorType()
-	amount, err := ety.Amount(tx)
-	if err != nil {
-		return err
-	}
-	if amount < 0 {
-		return types.ErrAmount
+
+	//TODO 数额在账户操作中会做检测, 此处不需要(提升性能), 需要确认在现有链中是否有分叉
+	if !subCfg.DisableCheckTxAmount {
+		ety := c.GetExecutorType()
+		amount, err := ety.Amount(tx)
+		if err != nil {
+			return err
+		}
+		if amount < 0 {
+			return types.ErrAmount
+		}
 	}
 	return nil
 }
@@ -81,6 +97,8 @@ func (c *Coins) IsFriend(myexec, writekey []byte, othertx *types.Transaction) bo
 		return false
 	}
 	//step2 判定 othertx 的 执行器名称(只允许主链，并且是挖矿的行为)
+	types.AssertConfig(c.GetAPI())
+	types := c.GetAPI().GetConfig()
 	if othertx.ActionName() == "miner" {
 		for _, exec := range types.GetMinerExecs() {
 			if types.ExecName(exec) == string(othertx.Execer) {

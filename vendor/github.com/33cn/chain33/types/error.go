@@ -10,6 +10,8 @@ import (
 
 // chain33定义的错误类型
 var (
+	ErrSequenceNotMatch        = errors.New("ErrSequenceNotMatch")
+	ErrSequenceTooBig          = errors.New("ErrSequenceTooBig")
 	ErrTooManySeqCB            = errors.New("ErrTooManySeqCB")
 	ErrPushSeqPostData         = errors.New("ErrPushSeqPostData")
 	ErrMethodReturnType        = errors.New("ErrMethodReturnType")
@@ -48,7 +50,10 @@ var (
 	ErrCoinBaseTicketStatus    = errors.New("ErrCoinBaseTicketStatus")
 	ErrBlockNotFound           = errors.New("ErrBlockNotFound")
 	ErrLogType                 = errors.New("ErrLogType")
+	ErrNilTransaction          = errors.New("ErrNilTransaction")
+	ErrCacheOverFlow           = errors.New("ErrCacheOverFlow")
 	ErrInvalidParam            = errors.New("ErrInvalidParam")
+	ErrInvalidExpire           = errors.New("ErrInvalidExpire")
 	ErrInvalidAddress          = errors.New("ErrInvalidAddress")
 	ErrNotInited               = errors.New("ErrNotInited")
 
@@ -72,6 +77,7 @@ var (
 	ErrTxExpire                   = errors.New("ErrTxExpire")
 	ErrHeaderNotSet               = errors.New("ErrHeaderNotSet")
 	ErrSign                       = errors.New("ErrSign")
+	ErrCertificate                = errors.New("ErrCertificate")
 	ErrFeeTooLow                  = errors.New("ErrFeeTooLow")
 	ErrEmptyTx                    = errors.New("ErrEmptyTx")
 	ErrTxFeeTooLow                = errors.New("ErrTxFeeTooLow")
@@ -141,6 +147,7 @@ var (
 	ErrVersion    = errors.New("ErrVersionNoSupport")
 	ErrStreamPing = errors.New("ErrStreamPing")
 	ErrPeerStop   = errors.New("ErrPeerStop")
+	ErrP2PChannel = errors.New("ErrIllegalP2PChannel")
 
 	ErrBlockSize                  = errors.New("ErrBlockSize")
 	ErrTxGroupIndex               = errors.New("ErrTxGroupIndex")
@@ -161,6 +168,7 @@ var (
 	ErrNotAllowMemSetKey          = errors.New("ErrNotAllowMemSetKey")
 	ErrNotAllowMemSetLocalKey     = errors.New("ErrNotAllowMemSetLocalKey")
 	ErrDataBaseDamage             = errors.New("ErrDataBaseDamage")
+	ErrGetStateDB                 = errors.New("ErrGetStateDB")
 	ErrIndex                      = errors.New("ErrIndex")
 	ErrTxGroupParaCount           = errors.New("ErrTxGroupParaCount")
 	ErrTxGroupParaMainMixed       = errors.New("ErrTxGroupParaMainMixed")
@@ -186,4 +194,17 @@ var (
 
 	ErrDisableWrite = errors.New("ErrDisableWrite")
 	ErrDisableRead  = errors.New("ErrDisableRead")
+
+	ErrConsensusHashErr   = errors.New("ErrConsensusHashErr")
+	ErrMaxCountPerTime    = errors.New("ErrMaxCountPerTime")
+	ErrInValidFileHeader  = errors.New("ErrInValidFileHeader")
+	ErrFileExists         = errors.New("ErrFileExists")
+	ErrSubscriberExist    = errors.New("ErrSubscriberExist")
+	ErrTooManySubscriber  = errors.New("ErrTooManySubscriber")
+	ErrPushNotSupport     = errors.New("ErrPushNotSupport")
+	ErrNotAllowModifyPush = errors.New("ErrNotAllowModifyPush")
+	ErrTxReceiptReduced   = errors.New("ErrTxReceiptReduced")
+	ErrPushNotSubscribed  = errors.New("ErrPushNotSubscribed")
+	ErrTxChainID          = errors.New("ErrTxChainID")
+	ErrTimeout            = errors.New("ErrTimeout")
 )

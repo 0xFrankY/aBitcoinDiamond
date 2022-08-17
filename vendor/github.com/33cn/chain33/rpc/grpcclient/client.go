@@ -1,6 +1,7 @@
 package grpcclient
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -17,13 +18,13 @@ var mu sync.Mutex
 var defaultClient types.Chain33Client
 
 //NewMainChainClient 创建一个平行链的 主链 grpc chain33 客户端
-func NewMainChainClient(grpcaddr string) (types.Chain33Client, error) {
+func NewMainChainClient(cfg *types.Chain33Config, grpcaddr string) (types.Chain33Client, error) {
 	mu.Lock()
 	defer mu.Unlock()
 	if grpcaddr == "" && defaultClient != nil {
 		return defaultClient, nil
 	}
-	paraRemoteGrpcClient := types.Conf("config.consensus.sub.para").GStr("ParaRemoteGrpcClient")
+	paraRemoteGrpcClient := types.Conf(cfg, "config.consensus.sub.para").GStr("ParaRemoteGrpcClient")
 	if grpcaddr != "" {
 		paraRemoteGrpcClient = grpcaddr
 	}
@@ -35,9 +36,20 @@ func NewMainChainClient(grpcaddr string) (types.Chain33Client, error) {
 		Timeout:             time.Second * 20,
 		PermitWithoutStream: true,
 	}
-	conn, err := grpc.Dial(NewMultipleURL(paraRemoteGrpcClient), grpc.WithInsecure(),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(paraChainGrpcRecSize)),
-		grpc.WithKeepaliveParams(kp))
+
+	var conn *grpc.ClientConn
+	var err error
+	useLBSync := types.Conf(cfg, "config.consensus.sub.para").IsEnable("useGrpcLBSync")
+	if useLBSync {
+		conn, err = grpc.Dial(NewSyncURL(paraRemoteGrpcClient), grpc.WithInsecure(),
+			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(paraChainGrpcRecSize)),
+			grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"LoadBalancingPolicy": "%s"}`, SyncLbName)),
+			grpc.WithKeepaliveParams(kp))
+	} else {
+		conn, err = grpc.Dial(NewMultipleURL(paraRemoteGrpcClient), grpc.WithInsecure(),
+			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(paraChainGrpcRecSize)),
+			grpc.WithKeepaliveParams(kp))
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -10,12 +10,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
+	"unsafe"
+
+	"github.com/pkg/errors"
+	"github.com/shopspring/decimal"
 
 	"github.com/33cn/chain33/common"
 	"github.com/33cn/chain33/common/address"
-	"github.com/33cn/chain33/common/crypto"
 	log "github.com/33cn/chain33/common/log/log15"
 	"github.com/33cn/chain33/types/jsonpb"
 	"github.com/golang/protobuf/proto"
@@ -32,25 +36,32 @@ const Size1Kshiftlen uint = 10
 // Message 声明proto.Message
 type Message proto.Message
 
-//TxGroup 交易组的接口，Transactions 和 Transaction 都符合这个接口
-type TxGroup interface {
-	Tx() *Transaction
-	GetTxGroup() (*Transactions, error)
-	CheckSign() bool
-}
-
 //ExecName  执行器name
-func ExecName(name string) string {
+func (c *Chain33Config) ExecName(name string) string {
 	if len(name) > 1 && name[0] == '#' {
 		return name[1:]
 	}
 	if IsParaExecName(name) {
 		return name
 	}
-	if IsPara() {
-		return GetTitle() + name
+	if c.IsPara() {
+		return c.GetTitle() + name
 	}
 	return name
+}
+
+//GetExecName 根据paraName 获取exec name
+func GetExecName(exec, paraName string) string {
+	if len(exec) > 1 && exec[0] == '#' {
+		return exec[1:]
+	}
+	if IsParaExecName(exec) {
+		return exec
+	}
+	if len(paraName) > 0 {
+		return paraName + exec
+	}
+	return exec
 }
 
 //IsAllowExecName 默认的allow 规则->根据 GetRealExecName 来判断
@@ -130,16 +141,16 @@ func FindExecer(key []byte) (execer []byte, err error) {
 }
 
 //GetParaExec  获取平行链执行
-func GetParaExec(execer []byte) []byte {
+func (c *Chain33Config) GetParaExec(execer []byte) []byte {
 	//必须是平行链
-	if !IsPara() {
+	if !c.IsPara() {
 		return execer
 	}
 	//必须是相同的平行链
-	if !strings.HasPrefix(string(execer), GetTitle()) {
+	if !strings.HasPrefix(string(execer), c.GetTitle()) {
 		return execer
 	}
-	return execer[len(GetTitle()):]
+	return execer[len(c.GetTitle()):]
 }
 
 //GetParaExecName 获取平行链上的执行器
@@ -190,13 +201,33 @@ func GetRealExecName(execer []byte) []byte {
 	return execer
 }
 
-//Encode  编码
+// EncodeWithBuffer encode with input buffer
+func EncodeWithBuffer(data proto.Message, buf *proto.Buffer) []byte {
+	return encodeProto(data, buf)
+}
+
+//Encode encode msg
 func Encode(data proto.Message) []byte {
-	b, err := proto.Marshal(data)
+	return encodeProto(data, nil)
+}
+
+// protobuf V2(golang/protobuf 1.4.0+)
+// 版本默认Marshal接口不保证序列化结果一致性, 需要主动设置相关标志
+// 即使设置了deterministic标志, protobuf官方也不保证后续版本升级以及跨语言的序列化结果一致
+// 即该标志只能保证当前版本具备一致性
+func encodeProto(data proto.Message, buf *proto.Buffer) []byte {
+
+	if buf == nil {
+		var b [0]byte
+		buf = proto.NewBuffer(b[:])
+	}
+	// 设置确定性编码
+	buf.SetDeterministic(true)
+	err := buf.Marshal(data)
 	if err != nil {
 		panic(err)
 	}
-	return b
+	return buf.Bytes()
 }
 
 //Size  消息大小
@@ -222,10 +253,7 @@ func JSONToPBUTF8(data []byte, msg proto.Message) error {
 
 //Hash  计算叶子节点的hash
 func (leafnode *LeafNode) Hash() []byte {
-	data, err := proto.Marshal(leafnode)
-	if err != nil {
-		panic(err)
-	}
+	data := Encode(leafnode)
 	return common.Sha256(data)
 }
 
@@ -242,10 +270,7 @@ func (innernode *InnerNode) Hash() []byte {
 	if len(innernode.LeftHash) > hashLen {
 		innernode.LeftHash = innernode.LeftHash[len(innernode.LeftHash)-hashLen:]
 	}
-	data, err := proto.Marshal(innernode)
-	if err != nil {
-		panic(err)
-	}
+	data := Encode(innernode)
 	innernode.RightHash = rightHash
 	innernode.LeftHash = leftHash
 	return common.Sha256(data)
@@ -259,8 +284,8 @@ func NewErrReceipt(err error) *Receipt {
 }
 
 //CheckAmount  检测转账金额
-func CheckAmount(amount int64) bool {
-	if amount <= 0 || amount >= MaxCoin {
+func CheckAmount(amount, coinPrecision int64) bool {
+	if amount <= 0 || amount >= MaxCoin*coinPrecision {
 		return false
 	}
 	return true
@@ -273,38 +298,6 @@ func GetEventName(event int) string {
 		return name
 	}
 	return "unknow-event"
-}
-
-//GetSignName  获取签名类型
-func GetSignName(execer string, signType int) string {
-	//优先加载执行器的签名类型
-	if execer != "" {
-		exec := LoadExecutorType(execer)
-		if exec != nil {
-			name, err := exec.GetCryptoDriver(signType)
-			if err == nil {
-				return name
-			}
-		}
-	}
-	//加载系统执行器的签名类型
-	return crypto.GetName(signType)
-}
-
-//GetSignType  获取签名类型
-func GetSignType(execer string, name string) int {
-	//优先加载执行器的签名类型
-	if execer != "" {
-		exec := LoadExecutorType(execer)
-		if exec != nil {
-			ty, err := exec.GetCryptoType(name)
-			if err == nil {
-				return ty
-			}
-		}
-	}
-	//加载系统执行器的签名类型
-	return crypto.GetType(name)
 }
 
 // ConfigPrefix 配置前缀key
@@ -322,14 +315,6 @@ var ManagePrefix = "mavl-"
 //ManageKey 超级管理员账户key
 func ManageKey(key string) string {
 	return fmt.Sprintf("%s-%s", ManagePrefix+"manage", key)
-}
-
-//ManaeKeyWithHeigh 超级管理员账户key
-func ManaeKeyWithHeigh(key string, height int64) string {
-	if IsFork(height, "ForkExecKey") {
-		return ManageKey(key)
-	}
-	return ConfigKey(key)
 }
 
 //ReceiptDataResult 回执数据
@@ -399,7 +384,7 @@ func (r *ReceiptData) OutputReceiptDetails(execer []byte, logger log.Logger) {
 
 //IterateRangeByStateHash 迭代查找
 func (t *ReplyGetTotalCoins) IterateRangeByStateHash(key, value []byte) bool {
-	fmt.Println("ReplyGetTotalCoins.IterateRangeByStateHash", "key", string(key))
+	tlog.Debug("ReplyGetTotalCoins.IterateRangeByStateHash", "key", string(key))
 	var acc Account
 	err := Decode(value, &acc)
 	if err != nil {
@@ -474,7 +459,7 @@ func (t *ReplyGetExecBalance) AddItem(execAddr, value []byte) {
 		tlog.Error("ReplyGetExecBalance.AddItem", "err", err)
 		return
 	}
-	tlog.Info("acc:", "value", acc)
+	tlog.Info("acc:", "value", &acc)
 	t.Amount += acc.Balance
 	t.Amount += acc.Frozen
 
@@ -483,4 +468,234 @@ func (t *ReplyGetExecBalance) AddItem(execAddr, value []byte) {
 
 	item := &ExecBalanceItem{ExecAddr: execAddr, Frozen: acc.Frozen, Active: acc.Balance}
 	t.Items = append(t.Items, item)
+}
+
+// CloneAccount copy account
+func CloneAccount(acc *Account) *Account {
+	return &Account{
+		Currency: acc.Currency,
+		Balance:  acc.Balance,
+		Frozen:   acc.Frozen,
+		Addr:     acc.Addr,
+	}
+}
+
+//Clone  克隆
+func Clone(data proto.Message) proto.Message {
+	return proto.Clone(data)
+}
+
+//Clone 添加一个浅拷贝函数
+func (sig *Signature) Clone() *Signature {
+	if sig == nil {
+		return nil
+	}
+	return &Signature{
+		Ty:        sig.Ty,
+		Pubkey:    sig.Pubkey,
+		Signature: sig.Signature,
+	}
+}
+
+//Clone 浅拷贝： BlockDetail
+func (b *BlockDetail) Clone() *BlockDetail {
+	if b == nil {
+		return nil
+	}
+	return &BlockDetail{
+		Block:          b.Block.Clone(),
+		Receipts:       CloneReceipts(b.Receipts),
+		KV:             cloneKVList(b.KV),
+		PrevStatusHash: b.PrevStatusHash,
+	}
+}
+
+//Clone 浅拷贝ReceiptData
+func (r *ReceiptData) Clone() *ReceiptData {
+	if r == nil {
+		return nil
+	}
+	return &ReceiptData{
+		Ty:   r.Ty,
+		Logs: cloneReceiptLogs(r.Logs),
+	}
+}
+
+//Clone 浅拷贝 receiptLog
+func (r *ReceiptLog) Clone() *ReceiptLog {
+	if r == nil {
+		return nil
+	}
+	return &ReceiptLog{
+		Ty:  r.Ty,
+		Log: r.Log,
+	}
+}
+
+//Clone KeyValue
+func (kv *KeyValue) Clone() *KeyValue {
+	if kv == nil {
+		return nil
+	}
+	return &KeyValue{
+		Key:   kv.Key,
+		Value: kv.Value,
+	}
+}
+
+//Clone Block 浅拷贝(所有的types.Message 进行了拷贝)
+func (b *Block) Clone() *Block {
+	if b == nil {
+		return nil
+	}
+	return &Block{
+		Version:    b.Version,
+		ParentHash: b.ParentHash,
+		TxHash:     b.TxHash,
+		StateHash:  b.StateHash,
+		Height:     b.Height,
+		BlockTime:  b.BlockTime,
+		Difficulty: b.Difficulty,
+		MainHash:   b.MainHash,
+		MainHeight: b.MainHeight,
+		Signature:  b.Signature.Clone(),
+		Txs:        cloneTxs(b.Txs),
+	}
+}
+
+//Clone BlockBody 浅拷贝(所有的types.Message 进行了拷贝)
+func (b *BlockBody) Clone() *BlockBody {
+	if b == nil {
+		return nil
+	}
+	return &BlockBody{
+		Txs:        cloneTxs(b.Txs),
+		Receipts:   CloneReceipts(b.Receipts),
+		MainHash:   b.MainHash,
+		MainHeight: b.MainHeight,
+		Hash:       b.Hash,
+		Height:     b.Height,
+	}
+}
+
+//CloneReceipts 浅拷贝交易回报
+func CloneReceipts(b []*ReceiptData) []*ReceiptData {
+	if b == nil {
+		return nil
+	}
+	rs := make([]*ReceiptData, len(b))
+	for i := 0; i < len(b); i++ {
+		rs[i] = b[i].Clone()
+	}
+	return rs
+}
+
+//cloneReceiptLogs 浅拷贝 ReceiptLogs
+func cloneReceiptLogs(b []*ReceiptLog) []*ReceiptLog {
+	if b == nil {
+		return nil
+	}
+	rs := make([]*ReceiptLog, len(b))
+	for i := 0; i < len(b); i++ {
+		rs[i] = b[i].Clone()
+	}
+	return rs
+}
+
+//cloneKVList 拷贝kv 列表
+func cloneKVList(b []*KeyValue) []*KeyValue {
+	if b == nil {
+		return nil
+	}
+	kv := make([]*KeyValue, len(b))
+	for i := 0; i < len(b); i++ {
+		kv[i] = b[i].Clone()
+	}
+	return kv
+}
+
+// Bytes2Str 高效字节数组转字符串
+// 相比普通直接转化，性能提升35倍，提升程度和转换的byte长度线性相关，且不存在内存开销
+// 需要注意b的修改会导致最终string的变更，比较适合临时变量转换，不适合
+func Bytes2Str(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+// Str2Bytes 高效字符串转字节数组
+// 相比普通直接转化，性能提升13倍， 提升程度和转换的byte长度线性相关，且不存在内存开销
+// 需要注意不能修改转换后的byte数组，本质上是修改了底层string，将会panic
+func Str2Bytes(s string) []byte {
+	x := (*[2]uintptr)(unsafe.Pointer(&s))
+	h := [3]uintptr{x[0], x[1], x[1]}
+	return *(*[]byte)(unsafe.Pointer(&h))
+}
+
+//Hash  计算hash
+func (hashes *ReplyHashes) Hash() []byte {
+	data := Encode(hashes)
+	return common.Sha256(data)
+}
+
+//FormatAmount2FloatDisplay 将传输、计算的amount值按精度格式化成浮点显示值，支持精度可配置
+//strconv.FormatFloat(float64(amount/types.Int1E4)/types.Float1E4, 'f', 4, 64) 的方法在amount很大的时候会丢失精度
+//比如在9001234567812345678时候，float64 最大精度只能在900123456781234的大小，decimal处理可以完整保持精度
+//在coinPrecision支持可配时候，对不同精度统一处理,而不是限定在1e4
+//round:是否需要对小数后四位值圆整，以912345678为例，912345678/1e8=9.1235, 非圆整例子:(912345678/1e4)/float(1e4)
+func FormatAmount2FloatDisplay(amount, coinPrecision int64, round bool) string {
+	n := int64(math.Log10(float64(coinPrecision)))
+	//小数左移n位，0保持不变
+	d := decimal.NewFromInt(amount).Shift(int32(-n))
+
+	//coinPrecision:5~8,
+	//v=99.12345678  => 99.1234,需要先truncate掉，不然5678会round到前一位也就是99.1235
+	if n > ShowPrecisionNum {
+		//有些需要圆整上来的,比如交易费,0.12345678,圆整为0.1235
+		if round {
+			return d.StringFixedBank(int32(ShowPrecisionNum))
+		}
+		//有些需要直接truncate掉
+		return d.Truncate(int32(ShowPrecisionNum)).StringFixedBank(int32(ShowPrecisionNum))
+
+	}
+
+	return d.StringFixedBank(int32(n))
+}
+
+//FormatAmount2FixPrecisionDisplay 将传输、计算的amount值按配置精度格式化成浮点显示值，不设缺省精度
+func FormatAmount2FixPrecisionDisplay(amount, coinPrecision int64) string {
+	n := int64(math.Log10(float64(coinPrecision)))
+	//小数左移n位，0保持不变
+	d := decimal.NewFromInt(amount).Shift(int32(-n))
+
+	return d.StringFixedBank(int32(n))
+}
+
+//FormatFloatDisplay2Value 将显示、输入的float amount值按精度格式化成计算值，小数点后精度只保留4位
+//浮点数算上浮点能精确表达最大16位长的数字(1234567.12345678),考虑到16个9会被表示为1e16,这里限制最多15个字符
+//本函数然后小数位只精确到4位，后面补0
+func FormatFloatDisplay2Value(amount float64, coinPrecision int64) (int64, error) {
+	f := decimal.NewFromFloat(amount)
+	strVal := f.String()
+	if len(strVal) <= 0 {
+		return 0, errors.Wrapf(ErrInvalidParam, "input=%f", amount)
+	}
+	//小数位输入不能超过配置小数位精度
+	coinPrecisionNum := int(math.Log10(float64(coinPrecision)))
+	i := strings.Index(strVal, ".")
+	if i > 0 && len(strVal)-i-1 > coinPrecisionNum {
+		return 0, errors.Wrapf(ErrInvalidParam, "input decimalpoint num=%d great than config coinPrecision=%d", len(strVal)-i-1, coinPrecisionNum)
+	}
+
+	//因为float精度原因，限制输入浮点数最多字符数
+	if len(strVal) > MaxFloatCharNum {
+		return 0, errors.Wrapf(ErrInvalidParam, "input=%f,len=%d great than %v", amount, len(strVal), MaxFloatCharNum)
+	}
+
+	//如果配置精度超过4位，小数位只精确到后4位, 例如1.23456789 ->123450000
+	if int64(coinPrecisionNum) > ShowPrecisionNum {
+		return f.Truncate(int32(ShowPrecisionNum)).Shift(int32(coinPrecisionNum)).IntPart(), nil
+	}
+	//如果配置精度小于4位，乘精度
+	return f.Shift(int32(coinPrecisionNum)).IntPart(), nil
+
 }

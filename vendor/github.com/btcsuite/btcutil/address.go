@@ -11,8 +11,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/aBitcoinDiamond/btcec"
-	"github.com/aBitcoinDiamond/chaincfg"
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcutil/base58"
 	"github.com/btcsuite/btcutil/bech32"
 	"golang.org/x/crypto/ripemd160"
@@ -23,7 +23,7 @@ import (
 type UnsupportedWitnessVerError byte
 
 func (e UnsupportedWitnessVerError) Error() string {
-	return "unsupported witness version: " + string(e)
+	return fmt.Sprintf("unsupported witness version: %#x", e)
 }
 
 // UnsupportedWitnessProgLenError describes an error where a segwit address
@@ -31,7 +31,7 @@ func (e UnsupportedWitnessVerError) Error() string {
 type UnsupportedWitnessProgLenError int
 
 func (e UnsupportedWitnessProgLenError) Error() string {
-	return "unsupported witness program length: " + string(e)
+	return fmt.Sprintf("unsupported witness program length: %d", e)
 }
 
 var (

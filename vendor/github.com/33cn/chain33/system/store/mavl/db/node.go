@@ -12,7 +12,6 @@ import (
 	"github.com/33cn/chain33/common"
 	"github.com/33cn/chain33/types"
 	farm "github.com/dgryski/go-farm"
-	"github.com/golang/protobuf/proto"
 )
 
 // Node merkle avl Node
@@ -48,7 +47,7 @@ func MakeNode(buf []byte, t *Tree) (node *Node, err error) {
 
 	var storeNode types.StoreNode
 
-	err = proto.Unmarshal(buf, &storeNode)
+	err = types.Decode(buf, &storeNode)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +170,7 @@ func (node *Node) Hash(t *Tree) []byte {
 		leafnode.Value = node.value
 		node.hash = leafnode.Hash()
 
-		if enableMavlPrefix && node.height != t.root.height {
+		if t.config != nil && t.config.EnableMavlPrefix && node.height != t.root.height {
 			hashKey := genPrefixHashKey(node, t.blockHeight)
 			hashKey = append(hashKey, node.hash...)
 			node.hash = hashKey
@@ -201,13 +200,13 @@ func (node *Node) Hash(t *Tree) []byte {
 		}
 		innernode.RightHash = node.rightHash
 		node.hash = innernode.Hash()
-		if enableMavlPrefix && node.height != t.root.height {
+		if t.config != nil && t.config.EnableMavlPrefix && node.height != t.root.height {
 			hashKey := genPrefixHashKey(node, t.blockHeight)
 			hashKey = append(hashKey, node.hash...)
 			node.hash = hashKey
 		}
 
-		if enablePrune {
+		if t.config != nil && t.config.EnableMavlPrune {
 			//加入parentNode
 			if node.leftNode != nil && node.leftNode.height != t.root.height {
 				node.leftNode.parentNode = node
@@ -218,7 +217,7 @@ func (node *Node) Hash(t *Tree) []byte {
 		}
 	}
 
-	if enableMemTree {
+	if t.config != nil && t.config.EnableMemTree {
 		updateLocalMemTree(t, node)
 	}
 	return node.hash
@@ -257,11 +256,7 @@ func (node *Node) saveRootHash(t *Tree) (err error) {
 	}
 	h := &types.Int64{}
 	h.Data = t.blockHeight
-	value, err := proto.Marshal(h)
-	if err != nil {
-		return err
-	}
-	t.ndb.batch.Set(genRootHashHeight(t.blockHeight, node.hash), value)
+	t.ndb.batch.Set(genRootHashHeight(t.blockHeight, node.hash), types.Encode(h))
 	return nil
 }
 
@@ -279,7 +274,8 @@ func (node *Node) storeNode(t *Tree) []byte {
 
 	//leafnode
 	if node.height == 0 {
-		if !enableMvcc {
+		if (t.config == nil) ||
+			(t.config != nil && !t.config.EnableMVCC) {
 			storeNode.Value = node.value
 		}
 	} else {
@@ -295,11 +291,7 @@ func (node *Node) storeNode(t *Tree) []byte {
 		}
 		storeNode.RightHash = node.rightHash
 	}
-	storeNodebytes, err := proto.Marshal(&storeNode)
-	if err != nil {
-		panic(err)
-	}
-	return storeNodebytes
+	return types.Encode(&storeNode)
 }
 
 //从指定node开始插入一个新的node，updated表示是否有叶子结点的value更新
@@ -503,7 +495,7 @@ func removeOrphan(t *Tree, node *Node) {
 	if t.ndb == nil {
 		return
 	}
-	if enableMemTree && t != nil {
+	if t != nil && t.config != nil && t.config.EnableMemTree {
 		t.obsoleteNode[uintkey(farm.Hash64(node.hash))] = struct{}{}
 	}
 	t.ndb.RemoveNode(t, node)

@@ -7,7 +7,7 @@ package base
 import (
 	"fmt"
 
-	"github.com/apache/thrift/lib/go/thrift"
+	"github.com/pegasus-kv/thrift/lib/go/thrift"
 )
 
 type Gpid struct {
@@ -26,7 +26,7 @@ func (id *Gpid) Read(iprot thrift.TProtocol) error {
 }
 
 func (id *Gpid) Write(oprot thrift.TProtocol) error {
-	v := int64(id.Appid) + int64(id.PartitionIndex<<32)
+	v := int64(id.Appid) + int64(id.PartitionIndex)<<32
 	return oprot.WriteI64(v)
 }
 
@@ -34,5 +34,5 @@ func (id *Gpid) String() string {
 	if id == nil {
 		return "<nil>"
 	}
-	return fmt.Sprintf("Gpid(%+v)", *id)
+	return fmt.Sprintf("%+v", *id)
 }

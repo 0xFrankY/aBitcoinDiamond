@@ -12,8 +12,8 @@ import (
 //数据的get set 主要经过 cache
 //如果需要进行list, 那么把get set 的内容加入到 后端数据库
 type LocalDB struct {
-	cache        map[string][]byte
-	txcache      map[string][]byte
+	cache        *cacheDB
+	txcache      *cacheDB
 	keys         []string
 	intx         bool
 	hasbegin     bool
@@ -26,20 +26,21 @@ type LocalDB struct {
 }
 
 //NewLocalDB 创建一个新的LocalDB
-func NewLocalDB(cli queue.Client) db.KVDB {
+func NewLocalDB(cli queue.Client, readOnly bool) db.KVDB {
 	api, err := client.New(cli, nil)
 	if err != nil {
 		panic(err)
 	}
-	txid, err := api.LocalNew(nil)
+	txid, err := api.LocalNew(readOnly)
 	if err != nil {
 		panic(err)
 	}
 	return &LocalDB{
-		cache:  make(map[string][]byte),
-		txid:   txid,
-		client: cli,
-		api:    api,
+		cache:   newcacheDB(1024),
+		txcache: newcacheDB(32),
+		txid:    txid,
+		client:  cli,
+		api:     api,
 	}
 }
 
@@ -65,7 +66,7 @@ func (l *LocalDB) EnableWrite() {
 
 func (l *LocalDB) resetTx() {
 	l.intx = false
-	l.txcache = nil
+	l.txcache.Reset()
 	l.keys = nil
 	l.hasbegin = false
 }
@@ -84,7 +85,7 @@ func (l *LocalDB) GetSetKeys() (keys []string) {
 func (l *LocalDB) Begin() {
 	l.intx = true
 	l.keys = nil
-	l.txcache = nil
+	l.txcache.Reset()
 	l.hasbegin = false
 }
 
@@ -115,9 +116,7 @@ func (l *LocalDB) save() error {
 
 //Commit 提交一个事务
 func (l *LocalDB) Commit() error {
-	for k, v := range l.txcache {
-		l.cache[k] = v
-	}
+	l.cache.Merge(l.txcache)
 	err := l.save()
 	if err != nil {
 		return err
@@ -131,7 +130,7 @@ func (l *LocalDB) Commit() error {
 
 //Close 提交一个事务
 func (l *LocalDB) Close() error {
-	l.cache = nil
+	l.cache.Reset()
 	l.resetTx()
 	err := l.api.LocalClose(l.txid)
 	return err
@@ -153,34 +152,28 @@ func (l *LocalDB) Get(key []byte) ([]byte, error) {
 	if l.disableread {
 		return nil, types.ErrDisableRead
 	}
-	skey := string(key)
-	if l.intx && l.txcache != nil {
-		if value, ok := l.txcache[skey]; ok {
-			return value, nil
+	if l.intx {
+		//hit the txcache
+		if value, incache, err := l.txcache.Get(key); incache {
+			return value, err
 		}
 	}
-	if value, ok := l.cache[skey]; ok {
-		if value == nil {
-			return nil, types.ErrNotFound
-		}
-		return value, nil
+	//hit the cache
+	if value, incache, err := l.cache.Get(key); incache {
+		return value, err
 	}
+	//not hit cache, query from db
 	query := &types.LocalDBGet{Txid: l.txid.Data, Keys: [][]byte{key}}
 	resp, err := l.api.LocalGet(query)
 	if err != nil {
 		panic(err) //no happen for ever
 	}
-	if nil == resp.Values {
-		l.cache[string(key)] = nil
+	if resp.Values == nil || resp.Values[0] == nil {
+		l.cache.Set(key, nil)
 		return nil, types.ErrNotFound
 	}
-	value := resp.Values[0]
-	if value == nil {
-		l.cache[string(key)] = nil
-		return nil, types.ErrNotFound
-	}
-	l.cache[string(key)] = value
-	return value, nil
+	l.cache.Set(key, resp.Values[0])
+	return resp.Values[0], nil
 }
 
 //Set 获取key
@@ -190,13 +183,10 @@ func (l *LocalDB) Set(key []byte, value []byte) error {
 	}
 	skey := string(key)
 	if l.intx {
-		if l.txcache == nil {
-			l.txcache = make(map[string][]byte)
-		}
 		l.keys = append(l.keys, skey)
-		setmap(l.txcache, skey, value)
+		l.txcache.Set(key, value)
 	} else {
-		setmap(l.cache, skey, value)
+		l.cache.Set(key, value)
 	}
 	l.kvs = append(l.kvs, &types.KeyValue{Key: key, Value: value})
 	return nil
@@ -227,4 +217,42 @@ func (l *LocalDB) List(prefix, key []byte, count, direction int32) ([][]byte, er
 // PrefixCount 从数据库中查询指定前缀的key的数量
 func (l *LocalDB) PrefixCount(prefix []byte) (count int64) {
 	panic("localdb not support PrefixCount")
+}
+
+type cacheDB struct {
+	data map[string][]byte
+}
+
+func newcacheDB(size int) *cacheDB {
+	return &cacheDB{
+		data: make(map[string][]byte, size),
+	}
+}
+
+//return a flag: is key is in cache
+func (db *cacheDB) Get(key []byte) (value []byte, incache bool, err error) {
+	if db.data == nil {
+		return nil, false, types.ErrNotFound
+	}
+	v, ok := db.data[string(key)]
+	if ok && v != nil {
+		return v, true, nil
+	}
+	return nil, ok, types.ErrNotFound
+}
+
+func (db *cacheDB) Set(key []byte, value []byte) {
+	db.data[string(key)] = value
+}
+
+func (db *cacheDB) Reset() {
+	for k := range db.data {
+		delete(db.data, k)
+	}
+}
+
+func (db *cacheDB) Merge(db2 *cacheDB) {
+	for k, v := range db2.data {
+		db.data[k] = v
+	}
 }

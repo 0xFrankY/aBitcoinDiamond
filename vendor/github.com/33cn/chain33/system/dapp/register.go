@@ -6,6 +6,7 @@ package dapp
 
 //store package store the world - state data
 import (
+	"github.com/33cn/chain33/client"
 	"github.com/33cn/chain33/common/address"
 	log "github.com/33cn/chain33/common/log/log15"
 	"github.com/33cn/chain33/types"
@@ -16,39 +17,53 @@ var elog = log.New("module", "execs")
 // DriverCreate defines a drivercreate function
 type DriverCreate func() Driver
 
+// KVChecker checks kv stored in db
+type KVChecker func(key, value []byte) bool
+
 type driverWithHeight struct {
 	create DriverCreate
 	height int64
 }
 
 var (
-	execDrivers        = make(map[string]*driverWithHeight)
-	execAddressNameMap = make(map[string]string)
-	registedExecDriver = make(map[string]*driverWithHeight)
+	execDrivers          = make(map[string]*driverWithHeight)
+	execAddressNameMap   = make(map[string]string)
+	registedExecDriver   = make(map[string]*driverWithHeight)
+	mvccKVExpiredChecker = make(map[string]KVChecker)
 )
 
 // Register register dcriver height in name
-func Register(name string, create DriverCreate, height int64) {
+func Register(cfg *types.Chain33Config, name string, create DriverCreate, height int64) {
+	if cfg == nil {
+		panic("Execute: GetConfig is nil")
+	}
 	if create == nil {
 		panic("Execute: Register driver is nil")
 	}
 	if _, dup := registedExecDriver[name]; dup {
 		panic("Execute: Register called twice for driver " + name)
 	}
-	driverWithHeight := &driverWithHeight{
+	driverHeight := &driverWithHeight{
 		create: create,
 		height: height,
 	}
-	registedExecDriver[name] = driverWithHeight
-	if types.IsPara() {
-		//平行链的合约地址是通过user.p.x.name计算的
-		paraDriverName := types.ExecName(name)
-		registerAddress(paraDriverName)
-		execDrivers[ExecAddress(paraDriverName)] = driverWithHeight
-	}
+	registedExecDriver[name] = driverHeight
 	//考虑到前期平行链兼容性和防止误操作(平行链下转账到一个主链合约)，也会注册主链合约(不带前缀)的地址
 	registerAddress(name)
-	execDrivers[ExecAddress(name)] = driverWithHeight
+	execDrivers[ExecAddress(name)] = driverHeight
+	if cfg.IsPara() {
+		paraHeight := cfg.GetFork("ForkEnableParaRegExec")
+		if paraHeight < height {
+			paraHeight = height
+		}
+		//平行链的合约地址是通过user.p.x.name计算的
+		paraDriverName := cfg.ExecName(name)
+		registerAddress(paraDriverName)
+		execDrivers[ExecAddress(paraDriverName)] = &driverWithHeight{
+			create: create,
+			height: paraHeight,
+		}
+	}
 }
 
 // LoadDriver load driver
@@ -67,15 +82,25 @@ func LoadDriver(name string, height int64) (driver Driver, err error) {
 	return nil, types.ErrUnknowDriver
 }
 
+//LoadDriverWithClient load
+func LoadDriverWithClient(qclent client.QueueProtocolAPI, name string, height int64) (driver Driver, err error) {
+	driver, err = LoadDriver(name, height)
+	if err != nil {
+		return nil, err
+	}
+	driver.SetAPI(qclent)
+	return driver, nil
+}
+
 // LoadDriverAllow load driver allow
-func LoadDriverAllow(tx *types.Transaction, index int, height int64) (driver Driver) {
-	exec, err := LoadDriver(string(tx.Execer), height)
+func LoadDriverAllow(qclent client.QueueProtocolAPI, tx *types.Transaction, index int, height int64) (driver Driver) {
+	exec, err := LoadDriverWithClient(qclent, string(tx.Execer), height)
 	if err == nil {
 		exec.SetEnv(height, 0, 0)
 		err = exec.Allow(tx, index)
 	}
 	if err != nil {
-		exec, err = LoadDriver("none", height)
+		exec, err = LoadDriverWithClient(qclent, "none", height)
 		if err != nil {
 			panic(err)
 		}
@@ -112,4 +137,32 @@ func ExecAddress(name string) string {
 		return addr
 	}
 	return address.ExecAddress(name)
+}
+
+// RegisterKVExpiredChecker registers dapp kv checker
+func RegisterKVExpiredChecker(name string, f KVChecker) {
+	// 目前只有 ticket 合约用到，如果合约里有需要精简的状态数据，可以自定义 KVChecker 校验规则
+	// KVChecker 返回 true 表示状态数据不会再使用，精简数据库时可以删除
+	if f == nil {
+		panic("Execute: KVExpiredChecker is nil")
+	}
+	if _, dup := mvccKVExpiredChecker[name]; dup {
+		panic("Execute: RegisterKVExpiredChecker called twice for " + name)
+	}
+	mvccKVExpiredChecker[name] = f
+}
+
+// LoadKVExpiredChecker loads dapp kv checker by dapp name
+func LoadKVExpiredChecker(name string) (KVChecker, bool) {
+	f, ok := mvccKVExpiredChecker[name]
+	return f, ok
+}
+
+// KVExpiredCheckerList gets names of dapp which has registered kv checker
+func KVExpiredCheckerList() []string {
+	var checkerNames []string
+	for name := range mvccKVExpiredChecker {
+		checkerNames = append(checkerNames, name)
+	}
+	return checkerNames
 }

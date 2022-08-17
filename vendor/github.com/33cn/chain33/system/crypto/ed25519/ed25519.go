@@ -11,7 +11,7 @@ import (
 	"fmt"
 
 	"github.com/33cn/chain33/common/crypto"
-	"github.com/33cn/chain33/common/ed25519"
+	"github.com/33cn/chain33/system/crypto/ed25519/ed25519"
 )
 
 //Driver 驱动
@@ -27,7 +27,7 @@ func (d Driver) GenKey() (crypto.PrivKey, error) {
 
 //PrivKeyFromBytes 字节转为私钥
 func (d Driver) PrivKeyFromBytes(b []byte) (privKey crypto.PrivKey, err error) {
-	if len(b) != 64 {
+	if len(b) != 64 && len(b) != 32 {
 		return nil, errors.New("invalid priv key byte")
 	}
 	privKeyBytes := new([64]byte)
@@ -51,6 +51,11 @@ func (d Driver) SignatureFromBytes(b []byte) (sig crypto.Signature, err error) {
 	sigBytes := new([64]byte)
 	copy(sigBytes[:], b[:])
 	return SignatureEd25519(*sigBytes), nil
+}
+
+// Validate validate msg and signature
+func (d Driver) Validate(msg, pub, sig []byte) error {
+	return crypto.BasicValidation(d, msg, pub, sig)
 }
 
 //PrivKeyEd25519 PrivKey
@@ -82,7 +87,6 @@ func (privKey PrivKeyEd25519) Equals(other crypto.PrivKey) bool {
 		return bytes.Equal(privKey[:], otherEd[:])
 	}
 	return false
-
 }
 
 //PubKeyEd25519 PubKey
@@ -122,7 +126,6 @@ func (pubKey PubKeyEd25519) Equals(other crypto.PubKey) bool {
 		return bytes.Equal(pubKey[:], otherEd[:])
 	}
 	return false
-
 }
 
 //SignatureEd25519 Signature
@@ -165,6 +168,5 @@ const (
 )
 
 func init() {
-	crypto.Register(Name, &Driver{})
-	crypto.RegisterType(Name, ID)
+	crypto.Register(Name, &Driver{}, crypto.WithRegOptionTypeID(ID))
 }

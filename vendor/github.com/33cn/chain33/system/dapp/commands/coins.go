@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/pkg/errors"
+
 	commandtypes "github.com/33cn/chain33/system/dapp/commands/types"
 	"github.com/33cn/chain33/types"
 	"github.com/spf13/cobra"
@@ -58,9 +60,16 @@ func createTransfer(cmd *cobra.Command, args []string) {
 	toAddr, _ := cmd.Flags().GetString("to")
 	amount, _ := cmd.Flags().GetFloat64("amount")
 	note, _ := cmd.Flags().GetString("note")
-	txHex, err := commandtypes.CreateRawTx(cmd, toAddr, amount, note, false, "", "")
+	paraName, _ := cmd.Flags().GetString("paraName")
+	rpcLaddr, _ := cmd.Flags().GetString("rpc_laddr")
+	cfg, err := commandtypes.GetChainConfig(rpcLaddr)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "GetChainConfig"))
+		return
+	}
+	txHex, err := commandtypes.CreateRawTx(paraName, toAddr, amount, note, false, "", "", cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "createRawTx"))
 		return
 	}
 	fmt.Println(txHex)
@@ -93,14 +102,22 @@ func createWithdraw(cmd *cobra.Command, args []string) {
 	note, _ := cmd.Flags().GetString("note")
 	paraName, _ := cmd.Flags().GetString("paraName")
 	realExec := getRealExecName(paraName, exec)
-	execAddr, err := commandtypes.GetExecAddr(realExec)
+
+	rpcLaddr, _ := cmd.Flags().GetString("rpc_laddr")
+	cfg, err := commandtypes.GetChainConfig(rpcLaddr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "GetChainConfig"))
+		return
+	}
+	execAddr, err := commandtypes.GetExecAddr(realExec, cfg.DefaultAddressID)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
 	}
-	txHex, err := commandtypes.CreateRawTx(cmd, execAddr, amount, note, true, "", realExec)
+
+	txHex, err := commandtypes.CreateRawTx(paraName, execAddr, amount, note, true, "", realExec, cfg)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "CreateRawTx"))
 		return
 	}
 	fmt.Println(txHex)
@@ -133,14 +150,23 @@ func sendToExec(cmd *cobra.Command, args []string) {
 	note, _ := cmd.Flags().GetString("note")
 	paraName, _ := cmd.Flags().GetString("paraName")
 	realExec := getRealExecName(paraName, exec)
-	execAddr, err := commandtypes.GetExecAddr(realExec)
+
+	rpcLaddr, _ := cmd.Flags().GetString("rpc_laddr")
+	cfg, err := commandtypes.GetChainConfig(rpcLaddr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "GetChainConfig"))
+		return
+	}
+
+	execAddr, err := commandtypes.GetExecAddr(realExec, cfg.DefaultAddressID)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
 	}
-	txHex, err := commandtypes.CreateRawTx(cmd, execAddr, amount, note, false, "", realExec)
+
+	txHex, err := commandtypes.CreateRawTx(paraName, execAddr, amount, note, false, "", realExec, cfg)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "CreateRawTx"))
 		return
 	}
 	fmt.Println(txHex)
@@ -163,8 +189,11 @@ func addCreateTxGroupFlags(cmd *cobra.Command) {
 }
 
 func createTxGroup(cmd *cobra.Command, args []string) {
+	title, _ := cmd.Flags().GetString("title")
+	cfg := types.GetCliSysParam(title)
 	txs, _ := cmd.Flags().GetString("txs")
 	file, _ := cmd.Flags().GetString("file")
+
 	var txsArr []string
 	if txs != "" {
 		txsArr = strings.Split(txs, " ")
@@ -210,12 +239,12 @@ func createTxGroup(cmd *cobra.Command, args []string) {
 		types.Decode(txByte, &transaction)
 		transactions = append(transactions, &transaction)
 	}
-	group, err := types.CreateTxGroup(transactions)
+	group, err := types.CreateTxGroup(transactions, cfg.GetMinTxFeeRate())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
 	}
-	err = group.Check(0, types.GInt("MinFee"), types.GInt("MaxFee"))
+	err = group.CheckWithFork(cfg, true, true, 0, cfg.GetMinTxFeeRate(), cfg.GetMaxTxFee())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return

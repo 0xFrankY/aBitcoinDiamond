@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/33cn/chain33/types"
@@ -49,6 +50,7 @@ type chanSub struct {
 	high    chan *Message
 	low     chan *Message
 	isClose int32
+	done    chan struct{}
 }
 
 // Queue only one obj in project
@@ -59,6 +61,8 @@ type Queue interface {
 	Start()
 	Client() Client
 	Name() string
+	SetConfig(cfg *types.Chain33Config)
+	GetConfig() *types.Chain33Config
 }
 
 type queue struct {
@@ -69,6 +73,8 @@ type queue struct {
 	callback  chan *Message
 	isClose   int32
 	name      string
+	cfg       *types.Chain33Config
+	msgPool   *sync.Pool
 }
 
 // New new queue struct
@@ -80,11 +86,18 @@ func New(name string) Queue {
 		interrupt: make(chan struct{}, 1),
 		callback:  make(chan *Message, 1024),
 	}
+	q.msgPool = &sync.Pool{
+		New: func() interface{} {
+			return &Message{
+				chReply: make(chan *Message, 1),
+			}
+		},
+	}
 	go func() {
 		for {
 			select {
 			case <-q.done:
-				fmt.Println("closing chain33 callback")
+				qlog.Info("closing chain33 callback")
 				return
 			case msg := <-q.callback:
 				if msg.callback != nil {
@@ -96,6 +109,22 @@ func New(name string) Queue {
 	return q
 }
 
+// GetConfig return the queue Chain33Config
+func (q *queue) GetConfig() *types.Chain33Config {
+	return q.cfg
+}
+
+// Name return the queue name
+func (q *queue) SetConfig(cfg *types.Chain33Config) {
+	if cfg == nil {
+		panic("set config is nil")
+	}
+	if q.cfg != nil {
+		panic("do not reset queue config")
+	}
+	q.cfg = cfg
+}
+
 // Name return the queue name
 func (q *queue) Name() string {
 	return q.name
@@ -104,19 +133,19 @@ func (q *queue) Name() string {
 // Start 开始运行消息队列
 func (q *queue) Start() {
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	// Block until a signal is received.
 	select {
 	case <-q.done:
-		fmt.Println("closing chain33 done")
+		qlog.Info("closing chain33 done")
 		//atomic.StoreInt32(&q.isClose, 1)
 		break
 	case <-q.interrupt:
-		fmt.Println("closing chain33")
+		qlog.Info("closing chain33")
 		//atomic.StoreInt32(&q.isClose, 1)
 		break
 	case s := <-c:
-		fmt.Println("Got signal:", s)
+		qlog.Info("Got signal:", "s", s)
 		//atomic.StoreInt32(&q.isClose, 1)
 		break
 	}
@@ -155,6 +184,7 @@ func (q *queue) chanSub(topic string) *chanSub {
 			high:    make(chan *Message, defaultChanBuffer),
 			low:     make(chan *Message, defaultLowChanBuffer),
 			isClose: 0,
+			done:    make(chan struct{}),
 		}
 	}
 	return q.chanSubs[topic]
@@ -167,10 +197,14 @@ func (q *queue) closeTopic(topic string) {
 	if !ok {
 		return
 	}
+	if sub.isClose == 1 {
+		return
+	}
 	if sub.isClose == 0 {
 		sub.high <- &Message{}
 		sub.low <- &Message{}
 	}
+	close(sub.done)
 	q.chanSubs[topic] = &chanSub{isClose: 1}
 }
 
@@ -183,8 +217,12 @@ func (q *queue) send(msg *Message, timeout time.Duration) (err error) {
 		return types.ErrChannelClosed
 	}
 	if timeout == -1 {
-		sub.high <- msg
-		return nil
+		select {
+		case sub.high <- msg:
+			return nil
+		case <-sub.done:
+			return types.ErrChannelClosed
+		}
 	}
 	defer func() {
 		res := recover()
@@ -315,9 +353,6 @@ func (msg *Message) Reply(replyMsg *Message) {
 		return
 	}
 	msg.chReply <- replyMsg
-	if msg.Topic != "store" {
-		qlog.Debug("reply msg ok", "msg", msg)
-	}
 }
 
 // String print the message information

@@ -7,6 +7,8 @@ package types
 
 import (
 	"encoding/json"
+
+	_ "github.com/33cn/chain33/system/address" // init address
 )
 
 // TransParm transport parameter
@@ -82,6 +84,7 @@ type Transaction struct {
 	Header     string          `json:"header,omitempty"`
 	Next       string          `json:"next,omitempty"`
 	Hash       string          `json:"hash,omitempty"`
+	ChainID    int32           `json:"chainID,omitempty"`
 }
 
 // ReceiptLog defines receipt log command
@@ -120,6 +123,10 @@ type Block struct {
 	Height     int64          `json:"height"`
 	BlockTime  int64          `json:"blockTime"`
 	Txs        []*Transaction `json:"txs"`
+	Difficulty uint32         ` json:"difficulty,omitempty"`
+	MainHash   string         ` json:"mainHash,omitempty"`
+	MainHeight int64          `json:"mainHeight,omitempty"`
+	Signature  *Signature     `json:"signature,omitempty"`
 }
 
 // BlockDetail  block detail
@@ -152,6 +159,15 @@ type TransactionDetail struct {
 	Fromaddr   string             `json:"fromAddr"`
 	ActionName string             `json:"actionName"`
 	Assets     []*Asset           `json:"assets"`
+	TxProofs   []*TxProof         `json:"txProofs"`
+	FullHash   string             `json:"fullHash"`
+}
+
+// TxProof :
+type TxProof struct {
+	Proofs   []string `json:"proofs"`
+	Index    uint32   `json:"index"`
+	RootHash string   `json:"rootHash"`
 }
 
 // ReplyTxInfos reply tx infos
@@ -200,12 +216,18 @@ type PeerList struct {
 
 // Peer  information
 type Peer struct {
-	Addr        string  `json:"addr"`
-	Port        int32   `json:"port"`
-	Name        string  `json:"name"`
-	MempoolSize int32   `json:"mempoolSize"`
-	Self        bool    `json:"self"`
-	Header      *Header `json:"header"`
+	Addr           string  `json:"addr"`
+	Port           int32   `json:"port"`
+	Name           string  `json:"name"`
+	MempoolSize    int32   `json:"mempoolSize"`
+	Self           bool    `json:"self"`
+	Header         *Header `json:"header"`
+	Version        string  `json:"version,omitempty"`
+	LocalDBVersion string  `json:"localDBVersion,omitempty"`
+	StoreDBVersion string  `json:"storeDBVersion,omitempty"`
+	RunningTime    string  `json:"runningTime,omitempty"`
+	FullNode       bool    `json:"fullNode,omitempty"`
+	Blocked        bool    `json:"blocked,omitempty"`
 }
 
 // WalletAccounts Wallet Module
@@ -243,6 +265,11 @@ type ReqAddr struct {
 	Addr string `json:"addr"`
 }
 
+// ReqStrings require strings
+type ReqStrings struct {
+	Datas []string `json:"datas"`
+}
+
 // ReqHashes require hashes
 type ReqHashes struct {
 	Hashes        []string `json:"hashes"`
@@ -251,13 +278,9 @@ type ReqHashes struct {
 
 // ReqWalletTransactionList require wallet transaction list
 type ReqWalletTransactionList struct {
-	FromTx          string `json:"fromTx"`
-	Count           int32  `json:"count"`
-	Direction       int32  `json:"direction"`
-	Mode            int32  `json:"mode,omitempty"`
-	SendRecvPrivacy int32  `json:"sendRecvPrivacy,omitempty"`
-	Address         string `json:"address,omitempty"`
-	TokenName       string `json:"tokenname,omitempty"`
+	FromTx    string `json:"fromTx"`
+	Count     int32  `json:"count"`
+	Direction int32  `json:"direction"`
 }
 
 // WalletTxDetails wallet tx details
@@ -315,13 +338,11 @@ type NodeNetinfo struct {
 	Service      bool   `json:"service"`
 	Outbounds    int32  `json:"outbounds"`
 	Inbounds     int32  `json:"inbounds"`
-}
-
-// ReplyPrivacyPkPair   reply privekey pubkey pair
-type ReplyPrivacyPkPair struct {
-	ShowSuccessful bool   `json:"showSuccessful,omitempty"`
-	ViewPub        string `json:"viewPub,omitempty"`
-	SpendPub       string `json:"spendPub,omitempty"`
+	Routingtable int32  `json:"routingtable"`
+	Peerstore    int32  `json:"peerstore"`
+	Ratein       string `json:"ratein"`
+	Rateout      string `json:"rateout"`
+	Ratetotal    string `json:"ratetotal"`
 }
 
 // ReplyCacheTxList reply cache tx list
@@ -391,4 +412,72 @@ type ReWriteRawTx struct {
 	Fee    int64  `json:"fee"`
 	Expire string `json:"expire"`
 	Index  int32  `json:"index"`
+}
+
+//BlockSeq parameter
+type BlockSeq struct {
+	Num    int64          `json:"num,omitempty"`
+	Seq    *BlockSequence `json:"seq,omitempty"`
+	Detail *BlockDetail   `json:"detail,omitempty"`
+}
+
+//BlockSequence parameter
+type BlockSequence struct {
+	Hash string `json:"hash,omitempty"`
+	Type int64  `json:"type,omitempty"`
+}
+
+//ParaTxDetails parameter
+type ParaTxDetails struct {
+	Items []*ParaTxDetail `json:"paraTxDetail"`
+}
+
+//ParaTxDetail parameter
+type ParaTxDetail struct {
+	Type      int64       `json:"type,omitempty"`
+	Header    *Header     `json:"header,omitempty"`
+	TxDetails []*TxDetail `json:"txDetail,omitempty"`
+	ChildHash string      `json:"childHash,omitempty"`
+	Index     uint32      `json:"index,omitempty"`
+	Proofs    []string    `json:"proofs,omitempty"`
+}
+
+//TxDetail parameter
+type TxDetail struct {
+	Index   uint32       `json:"index,omitempty"`
+	Tx      *Transaction `json:"tx,omitempty"`
+	Receipt *ReceiptData `json:"receipt,omitempty"`
+	Proofs  []string     `json:"proofs,omitempty"`
+}
+
+//ReplyHeightByTitle parameter
+type ReplyHeightByTitle struct {
+	Title string       `json:"title,omitempty"`
+	Items []*BlockInfo `json:"items,omitempty"`
+}
+
+//BlockInfo parameter
+type BlockInfo struct {
+	Height int64  `json:"height,omitempty"`
+	Hash   string `json:"hash,omitempty"`
+}
+
+//ChainIDInfo parameter
+type ChainIDInfo struct {
+	ChainID int32 `json:"chainID"`
+}
+
+//ChainConfigInfo parameter
+type ChainConfigInfo struct {
+	Title            string `json:"title,omitempty"`
+	CoinExec         string `json:"coinExec,omitempty"`
+	CoinSymbol       string `json:"coinSymbol,omitempty"`
+	CoinPrecision    int64  `json:"coinPrecision,omitempty"`
+	TokenPrecision   int64  `json:"tokenPrecision,omitempty"`
+	ChainID          int32  `json:"chainID,omitempty"`
+	MaxTxFee         int64  `json:"maxTxFee,omitempty"`
+	MinTxFeeRate     int64  `json:"minTxFeeRate,omitempty"`
+	MaxTxFeeRate     int64  `json:"maxTxFeeRate,omitempty"`
+	IsPara           bool   `json:"isPara,omitempty"`
+	DefaultAddressID int32  `json:"defaultAddressID"`
 }

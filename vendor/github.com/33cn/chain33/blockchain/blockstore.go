@@ -10,103 +10,166 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/33cn/chain33/common"
 	dbm "github.com/33cn/chain33/common/db"
 	"github.com/33cn/chain33/common/difficulty"
+	"github.com/33cn/chain33/common/utils"
 	"github.com/33cn/chain33/common/version"
 	"github.com/33cn/chain33/queue"
 	"github.com/33cn/chain33/types"
-	"github.com/golang/protobuf/proto"
 )
 
 //var
 var (
-	blockLastHeight             = []byte("blockLastHeight")
-	bodyPerfix                  = []byte("Body:")
-	LastSequence                = []byte("LastSequence")
-	headerPerfix                = []byte("Header:")
-	heightToHeaderPerfix        = []byte("HH:")
-	hashPerfix                  = []byte("Hash:")
-	tdPerfix                    = []byte("TD:")
-	heightToHashKeyPerfix       = []byte("Height:")
-	seqToHashKey                = []byte("Seq:")
-	HashToSeqPerfix             = []byte("HashToSeq:")
-	seqCBPrefix                 = []byte("SCB:")
-	seqCBLastNumPrefix          = []byte("SCBL:")
-	storeLog                    = chainlog.New("submodule", "store")
-	AddBlock              int64 = 1
-	DelBlock              int64 = 2
+	blockLastHeight       = []byte("blockLastHeight")
+	bodyPrefix            = []byte("Body:")
+	LastSequence          = []byte("LastSequence")
+	headerPrefix          = []byte("Header:")
+	heightToHeaderPrefix  = []byte("HH:")
+	hashPrefix            = []byte("Hash:")
+	tdPrefix              = []byte("TD:")
+	heightToHashKeyPrefix = []byte("Height:")
+	seqToHashKey          = []byte("Seq:")
+	HashToSeqPrefix       = []byte("HashToSeq:")
+	pushPrefix            = []byte("push2subscribe:")
+	lastSeqNumPrefix      = []byte("lastSeqNumPrefix:")
+	paraSeqToHashKey      = []byte("ParaSeq:")
+	HashToParaSeqPrefix   = []byte("HashToParaSeq:")
+	LastParaSequence      = []byte("LastParaSequence")
+	// chunk相关
+	BodyHashToChunk    = []byte("BodyHashToChunk:")
+	ChunkNumToHash     = []byte("ChunkNumToHash:")
+	ChunkHashToNum     = []byte("ChunkHashToNum:")
+	RecvChunkNumToHash = []byte("RecvChunkNumToHash:")
+	MaxSerialChunkNum  = []byte("MaxSilChunkNum:")
+	MaxDeletedChunkNum = []byte("MaxDeletedChunkNum:")
+	storeLog           = chainlog.New("submodule", "store")
 )
 
 //GetLocalDBKeyList 获取本地键值列表
+//增加chainBody和chainHeader对应的四个key。chainParaTx的可以在区块0高度时是没有的
+//bodyPrefix，headerPrefix，heightToHeaderPrefix这三个key不再使用
 func GetLocalDBKeyList() [][]byte {
 	return [][]byte{
-		blockLastHeight, bodyPerfix, LastSequence, headerPerfix, heightToHeaderPerfix,
-		hashPerfix, tdPerfix, heightToHashKeyPerfix, seqToHashKey, HashToSeqPerfix,
-		seqCBPrefix, seqCBLastNumPrefix, tempBlockKey, lastTempBlockKey,
+		blockLastHeight, bodyPrefix, LastSequence, headerPrefix, heightToHeaderPrefix,
+		hashPrefix, tdPrefix, heightToHashKeyPrefix, seqToHashKey, HashToSeqPrefix,
+		pushPrefix, lastSeqNumPrefix, tempBlockKey, lastTempBlockKey, LastParaSequence,
+		chainParaTxPrefix, chainBodyPrefix, chainHeaderPrefix, chainReceiptPrefix,
+		BodyHashToChunk, ChunkNumToHash, ChunkHashToNum, RecvChunkNumToHash,
+		MaxSerialChunkNum, MaxDeletedChunkNum,
 	}
 }
 
 //存储block hash对应的blockbody信息
 func calcHashToBlockBodyKey(hash []byte) []byte {
-	return append(bodyPerfix, hash...)
+	return append(bodyPrefix, hash...)
 }
 
-//并发访问的可能性(每次开辟新内存)
-func calcSeqCBKey(name []byte) []byte {
-	return append(append([]byte{}, seqCBPrefix...), name...)
+func calcPushKey(name string) []byte {
+	return []byte(string(pushPrefix) + name)
 }
 
-//并发访问的可能性(每次开辟新内存)
-func caclSeqCBLastNumKey(name []byte) []byte {
-	return append(append([]byte{}, seqCBLastNumPrefix...), name...)
+func calcLastPushSeqNumKey(name string) []byte {
+	return []byte(string(lastSeqNumPrefix) + name)
 }
 
 //存储block hash对应的header信息
 func calcHashToBlockHeaderKey(hash []byte) []byte {
-	return append(headerPerfix, hash...)
+	return append(headerPrefix, hash...)
 }
 
 func calcHeightToBlockHeaderKey(height int64) []byte {
-	return append(heightToHeaderPerfix, []byte(fmt.Sprintf("%012d", height))...)
+	return append(heightToHeaderPrefix, []byte(fmt.Sprintf("%012d", height))...)
 }
 
 //存储block hash对应的block height
-func calcHashToHeightKey(hash []byte) []byte {
-	return append(hashPerfix, hash...)
-}
+//func calcHashToHeightKey(hash []byte) []byte {
+//	return append(hashPrefix, hash...)
+//}
 
 //存储block hash对应的block总难度TD
 func calcHashToTdKey(hash []byte) []byte {
-	return append(tdPerfix, hash...)
+	return append(tdPrefix, hash...)
 }
 
 //存储block height 对应的block  hash
 func calcHeightToHashKey(height int64) []byte {
-	return append(heightToHashKeyPerfix, []byte(fmt.Sprintf("%v", height))...)
+	return append(heightToHashKeyPrefix, []byte(fmt.Sprintf("%v", height))...)
 }
 
 //存储block操作序列号对应的block hash,KEY=Seq:sequence
-func calcSequenceToHashKey(sequence int64) []byte {
+func calcSequenceToHashKey(sequence int64, isPara bool) []byte {
+	if isPara {
+		return append(paraSeqToHashKey, []byte(fmt.Sprintf("%v", sequence))...)
+	}
 	return append(seqToHashKey, []byte(fmt.Sprintf("%v", sequence))...)
 }
 
 //存储block hash对应的seq序列号，KEY=Seq:sequence，只用于平行链addblock操作，方便delblock回退是查找对应seq的hash
-func calcHashToSequenceKey(hash []byte) []byte {
-	return append(HashToSeqPerfix, hash...)
+func calcHashToSequenceKey(hash []byte, isPara bool) []byte {
+	if isPara {
+		return append(HashToParaSeqPrefix, hash...)
+	}
+	return append(HashToSeqPrefix, hash...)
 }
 
-//BlockStore 区块存储
+func calcLastSeqKey(isPara bool) []byte {
+	if isPara {
+		return LastParaSequence
+	}
+	return LastSequence
+}
+
+//存储block hash对应的seq序列号，KEY=Seq:sequence，只用于平行链addblock操作，方便delblock回退是查找对应seq的hash
+func calcHashToMainSequenceKey(hash []byte) []byte {
+	return append(HashToSeqPrefix, hash...)
+}
+
+//存储block操作序列号对应的block hash,KEY=MainSeq:sequence
+func calcMainSequenceToHashKey(sequence int64) []byte {
+	return append(seqToHashKey, []byte(fmt.Sprintf("%v", sequence))...)
+}
+
+//// 存储归档索引 blockhash--->chunkhash
+//func calcBlockHashToChunkHash(hash []byte) []byte {
+//	return append(BodyHashToChunk, hash...)
+//}
+
+// 存储归档索引 chunkNum--->chunkhash
+func calcChunkNumToHash(chunkNum int64) []byte {
+	return append(ChunkNumToHash, []byte(fmt.Sprintf("%012d", chunkNum))...)
+}
+
+// 存储归档索引 chunkhash--->chunkNum
+func calcChunkHashToNum(hash []byte) []byte {
+	return append(ChunkHashToNum, hash...)
+}
+
+// 存储归档索引 chunkNum--->chunkhash 从对端节点同步过来的归档索引
+func calcRecvChunkNumToHash(chunkNum int64) []byte {
+	return append(RecvChunkNumToHash, []byte(fmt.Sprintf("%012d", chunkNum))...)
+}
+
+//BlockStore 区块存储 TODO：有较多的冗余代码，接口函数需要进行功能梳理和重写
 type BlockStore struct {
 	db             dbm.DB
 	client         queue.Client
 	height         int64
 	lastBlock      *types.Block
 	lastheaderlock sync.Mutex
-	chain          *BlockChain
+	saveSequence   bool
+	isParaChain    bool
+	batch          dbm.Batch
+
+	//记录当前活跃的block，减少数据库的访问提高效率
+	activeBlocks *utils.SpaceLimitCache
+	chain        *BlockChain
+	blockCache   *BlockCache
 }
 
 //NewBlockStore new
@@ -119,20 +182,26 @@ func NewBlockStore(chain *BlockChain, db dbm.DB, client queue.Client) *BlockStor
 		}
 	}
 	blockStore := &BlockStore{
-		height: height,
-		db:     db,
-		client: client,
-		chain:  chain,
+		height:     height,
+		db:         db,
+		client:     client,
+		chain:      chain,
+		blockCache: chain.blockCache,
 	}
+	if chain != nil {
+		blockStore.saveSequence = chain.isRecordBlockSequence
+		blockStore.isParaChain = chain.isParaChain
+	}
+	cfg := chain.client.GetConfig()
 	if height == -1 {
 		chainlog.Info("load block height error, may be init database", "height", height)
-		if types.IsEnable("quickIndex") {
+		if cfg.IsEnable("quickIndex") {
 			blockStore.saveQuickIndexFlag()
 		}
 	} else {
-		blockdetail, err := blockStore.LoadBlockByHeight(height)
+		blockdetail, err := blockStore.LoadBlock(height, nil)
 		if err != nil {
-			chainlog.Error("init::LoadBlockByHeight::database may be crash")
+			chainlog.Error("init::LoadBlock::database may be crash")
 			panic(err)
 		}
 		blockStore.lastBlock = blockdetail.GetBlock()
@@ -140,7 +209,7 @@ func NewBlockStore(chain *BlockChain, db dbm.DB, client queue.Client) *BlockStor
 		if err != nil {
 			panic(err)
 		}
-		if types.IsEnable("quickIndex") {
+		if cfg.IsEnable("quickIndex") {
 			if flag == 0 {
 				blockStore.initQuickIndex(height)
 			}
@@ -150,6 +219,19 @@ func NewBlockStore(chain *BlockChain, db dbm.DB, client queue.Client) *BlockStor
 			}
 		}
 	}
+	blockStore.batch = db.NewBatch(true)
+
+	//初始化活跃区块的缓存
+	maxActiveBlockNum := maxActiveBlocks
+	maxActiveBlockSize := maxActiveBlocksCacheSize
+	if cfg.GetModuleConfig().BlockChain.MaxActiveBlockNum > 0 {
+		maxActiveBlockNum = cfg.GetModuleConfig().BlockChain.MaxActiveBlockNum
+	}
+	if cfg.GetModuleConfig().BlockChain.MaxActiveBlockSize > 0 {
+		maxActiveBlockSize = cfg.GetModuleConfig().BlockChain.MaxActiveBlockSize
+	}
+	blockStore.activeBlocks = utils.NewSpaceLimitCache(maxActiveBlockNum, maxActiveBlockSize*1024*1024)
+
 	return blockStore
 }
 
@@ -165,8 +247,9 @@ func (bs *BlockStore) initQuickIndex(height int64) {
 	batch := bs.db.NewBatch(true)
 	var maxsize = 100 * 1024 * 1024
 	var count = 0
+	cfg := bs.client.GetConfig()
 	for i := int64(0); i <= height; i++ {
-		blockdetail, err := bs.LoadBlockByHeight(i)
+		blockdetail, err := bs.LoadBlock(i, nil)
 		if err != nil {
 			panic(err)
 		}
@@ -177,7 +260,7 @@ func (bs *BlockStore) initQuickIndex(height int64) {
 				panic(err)
 			}
 			count += len(txresult)
-			batch.Set(types.CalcTxKey(hash), txresult)
+			batch.Set(cfg.CalcTxKey(hash), txresult)
 			batch.Set(types.CalcTxShortKey(hash), []byte("1"))
 		}
 		if count > maxsize {
@@ -201,44 +284,42 @@ func (bs *BlockStore) initQuickIndex(height int64) {
 	bs.saveQuickIndexFlag()
 }
 
-func (bs *BlockStore) isSeqCBExist(name string) bool {
-	value, err := bs.db.Get(calcSeqCBKey([]byte(name)))
-	if err == nil {
-		var cb types.BlockSeqCB
-		err = types.Decode(value, &cb)
-		return err == nil
-	}
-	return false
+// store通用接口: 非block相关的保存功能，用通用的接口
+// 避免store相关的代码膨胀
+
+// SetSync store通用接口
+func (bs *BlockStore) SetSync(key, value []byte) error {
+	return bs.db.SetSync(key, value)
 }
 
-func (bs *BlockStore) seqCBNum() int64 {
-	counts := dbm.NewListHelper(bs.db).PrefixCount(seqCBPrefix)
+// Set store通用接口
+func (bs *BlockStore) Set(key, value []byte) error {
+	return bs.db.Set(key, value)
+}
+
+// GetKey store通用接口， Get 已经被使用
+func (bs *BlockStore) GetKey(key []byte) ([]byte, error) {
+	value, err := bs.db.Get(key)
+	if err != nil && err != dbm.ErrNotFoundInDb {
+		return nil, types.ErrNotFound
+
+	}
+	return value, err
+}
+
+// PrefixCount store通用接口
+func (bs *BlockStore) PrefixCount(prefix []byte) int64 {
+	counts := dbm.NewListHelper(bs.db).PrefixCount(prefix)
 	return counts
 }
 
-func (bs *BlockStore) addBlockSeqCB(cb *types.BlockSeqCB) error {
-	if len(cb.Name) > 128 || len(cb.URL) > 1024 {
-		return types.ErrInvalidParam
-	}
-	storeLog.Info("addBlockSeqCB", "key", string(calcSeqCBKey([]byte(cb.Name))), "value", cb)
-
-	return bs.db.SetSync(calcSeqCBKey([]byte(cb.Name)), types.Encode(cb))
-}
-
-func (bs *BlockStore) listSeqCB() (cbs []*types.BlockSeqCB, err error) {
-	values := dbm.NewListHelper(bs.db).PrefixScan(seqCBPrefix)
+// List store通用接口
+func (bs *BlockStore) List(prefix []byte) ([][]byte, error) {
+	values := dbm.NewListHelper(bs.db).PrefixScan(prefix)
 	if values == nil {
 		return nil, types.ErrNotFound
 	}
-	for _, value := range values {
-		var cb types.BlockSeqCB
-		err := types.Decode(value, &cb)
-		if err != nil {
-			return nil, err
-		}
-		cbs = append(cbs, &cb)
-	}
-	return cbs, nil
+	return values, nil
 }
 
 func (bs *BlockStore) delAllKeys() {
@@ -315,16 +396,22 @@ func (bs *BlockStore) loadFlag(key []byte) (int64, error) {
 
 //HasTx 是否包含该交易
 func (bs *BlockStore) HasTx(key []byte) (bool, error) {
-	if types.IsEnable("quickIndex") {
+	cfg := bs.client.GetConfig()
+	if cfg.IsEnable("quickIndex") {
 		if _, err := bs.db.Get(types.CalcTxShortKey(key)); err != nil {
 			if err == dbm.ErrNotFoundInDb {
 				return false, nil
 			}
 			return false, err
 		}
-		return true, nil
+		//通过短hash查询交易存在时，需要再通过全hash索引查询一下。
+		//避免短hash重复，而全hash不一样的情况
+		//return true, nil
+		// 查重性能对比：
+		// 先查短哈希，再查全哈希，单次查询平均耗时10000ns
+		// 直接查全哈希，单次查询平均耗时24000ns
 	}
-	if _, err := bs.db.Get(types.CalcTxKey(key)); err != nil {
+	if _, err := bs.db.Get(cfg.CalcTxKey(key)); err != nil {
 		if err == dbm.ErrNotFoundInDb {
 			return false, nil
 		}
@@ -349,7 +436,7 @@ func (bs *BlockStore) UpdateHeight() {
 	storeLog.Debug("UpdateHeight", "curblockheight", height)
 }
 
-//UpdateHeight2 更新指定的block高度到BlockStore.Height
+//UpdateHeight2 更新指定的block高度到BlockStore.Height TODO：命名不清晰，不能体现和原来函数的区别
 func (bs *BlockStore) UpdateHeight2(height int64) {
 	atomic.StoreInt64(&bs.height, height)
 	storeLog.Debug("UpdateHeight2", "curblockheight", height)
@@ -372,7 +459,7 @@ func (bs *BlockStore) LastHeader() *types.Header {
 		blockheader.Signature = bs.lastBlock.Signature
 		blockheader.Difficulty = bs.lastBlock.Difficulty
 
-		blockheader.Hash = bs.lastBlock.Hash()
+		blockheader.Hash = bs.lastBlock.Hash(bs.client.GetConfig())
 		blockheader.TxCount = int64(len(bs.lastBlock.Txs))
 	}
 	return &blockheader
@@ -390,15 +477,15 @@ func (bs *BlockStore) UpdateLastBlock(hash []byte) {
 	if blockdetail != nil {
 		bs.lastBlock = blockdetail.Block
 	}
-	storeLog.Debug("UpdateLastBlock", "UpdateLastBlock", blockdetail.Block.Height, "LastHederhash", common.ToHex(blockdetail.Block.Hash()))
+	storeLog.Debug("UpdateLastBlock", "UpdateLastBlock", blockdetail.Block.Height, "LastHederhash", common.ToHex(blockdetail.Block.Hash(bs.client.GetConfig())))
 }
 
-//UpdateLastBlock2 更新LastBlock到缓存中
+//UpdateLastBlock2 更新LastBlock到缓存中 TODO:命名不清晰，不能体现和原来函数的区别
 func (bs *BlockStore) UpdateLastBlock2(block *types.Block) {
 	bs.lastheaderlock.Lock()
 	defer bs.lastheaderlock.Unlock()
 	bs.lastBlock = block
-	storeLog.Debug("UpdateLastBlock", "UpdateLastBlock", block.Height, "LastHederhash", common.ToHex(block.Hash()))
+	storeLog.Debug("UpdateLastBlock", "UpdateLastBlock", block.Height, "LastHederhash", common.ToHex(block.Hash(bs.client.GetConfig())))
 }
 
 //LastBlock 获取最新的block信息
@@ -425,14 +512,26 @@ func (bs *BlockStore) Get(keys *types.LocalDBGet) *types.LocalReplyValue {
 	return &reply
 }
 
-//LoadBlockByHeight 通过height高度获取BlockDetail信息
-func (bs *BlockStore) LoadBlockByHeight(height int64) (*types.BlockDetail, error) {
-	//首先通过height获取block hash从db中
-	hash, err := bs.GetBlockHashByHeight(height)
-	if err != nil {
-		return nil, err
+//LoadBlock 通过height高度获取BlockDetail信息, hash可为空
+//首先通过height+hash 主键获取header和body
+//如果失败使用旧的代码获取block信息
+//主要考虑到使用新的软件在localdb没有完成升级之前，
+//启动的过程中通过height获取区块时需要兼容旧的存储格式
+//升级完成正常启动之后通过loadBlockByIndex获取block不应该有失败
+//TODO:升级是否是一次性的，升级完成后需要将无效代码移除
+func (bs *BlockStore) LoadBlock(height int64, hash []byte) (block *types.BlockDetail, err error) {
+
+	if len(hash) == 0 {
+		hash, err = bs.GetBlockHashByHeight(height)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return bs.LoadBlockByHash(hash)
+	block, err = bs.loadBlockByIndex("", calcHeightHashKey(height, hash), nil)
+	if block == nil && err != nil {
+		return bs.loadBlockByHashOld(hash)
+	}
+	return block, nil
 }
 
 //LoadBlockByHash 通过hash获取BlockDetail信息
@@ -442,160 +541,108 @@ func (bs *BlockStore) LoadBlockByHash(hash []byte) (*types.BlockDetail, error) {
 }
 
 func (bs *BlockStore) loadBlockByHash(hash []byte) (*types.BlockDetail, int, error) {
-	var blockdetail types.BlockDetail
-	var blockheader types.Header
-	var blockbody types.BlockBody
-	var block types.Block
 	var blockSize int
 
-	//通过hash获取blockheader
-	header, err := bs.db.Get(calcHashToBlockHeaderKey(hash))
-	if header == nil || err != nil {
-		if err != dbm.ErrNotFoundInDb {
-			storeLog.Error("LoadBlockByHash calcHashToBlockHeaderKey", "hash", common.ToHex(hash), "err", err)
-		}
-		return nil, blockSize, types.ErrHashNotExist
-	}
-	err = proto.Unmarshal(header, &blockheader)
+	//通过hash索引获取blockdetail
+	blockdetail, err := bs.loadBlockByIndex("hash", hash, nil)
 	if err != nil {
-		storeLog.Error("LoadBlockByHash", "err", err)
+		storeLog.Error("loadBlockByHash:loadBlockByIndex", "hash", common.ToHex(hash), "err", err)
 		return nil, blockSize, err
 	}
-	blockSize += len(header)
-
-	//通过hash获取blockbody
-	body, err := bs.db.Get(calcHashToBlockBodyKey(hash))
-	if body == nil || err != nil {
-		if err != dbm.ErrNotFoundInDb {
-			storeLog.Error("LoadBlockByHash calcHashToBlockBodyKey ", "err", err)
-		}
-		return nil, blockSize, types.ErrHashNotExist
-	}
-	err = proto.Unmarshal(body, &blockbody)
-	if err != nil {
-		storeLog.Error("LoadBlockByHash", "err", err)
-		return nil, blockSize, err
-	}
-	blockSize += len(body)
-
-	block.Version = blockheader.Version
-	block.ParentHash = blockheader.ParentHash
-	block.TxHash = blockheader.TxHash
-	block.StateHash = blockheader.StateHash
-	block.Height = blockheader.Height
-	block.BlockTime = blockheader.BlockTime
-	block.Signature = blockheader.Signature
-	block.Difficulty = blockheader.Difficulty
-	block.Txs = blockbody.Txs
-	block.MainHeight = blockbody.MainHeight
-	block.MainHash = blockbody.MainHash
-
-	blockdetail.Receipts = blockbody.Receipts
-	blockdetail.Block = &block
-
-	//storeLog.Info("LoadBlockByHash", "Height", block.Height, "Difficulty", blockdetail.Block.Difficulty)
-
-	return &blockdetail, blockSize, nil
+	blockSize = blockdetail.Size()
+	return blockdetail, blockSize, nil
 }
 
 //SaveBlock 批量保存blocks信息到db数据库中,并返回最新的sequence值
 func (bs *BlockStore) SaveBlock(storeBatch dbm.Batch, blockdetail *types.BlockDetail, sequence int64) (int64, error) {
+	cfg := bs.client.GetConfig()
 	var lastSequence int64 = -1
 	height := blockdetail.Block.Height
 	if len(blockdetail.Receipts) == 0 && len(blockdetail.Block.Txs) != 0 {
 		storeLog.Error("SaveBlock Receipts is nil ", "height", height)
 	}
-	hash := blockdetail.Block.Hash()
-
-	// Save blockbody通过block hash
-	var blockbody types.BlockBody
-	blockbody.Txs = blockdetail.Block.Txs
-	blockbody.Receipts = blockdetail.Receipts
-	blockbody.MainHash = hash
-	blockbody.MainHeight = height
-	if types.IsPara() {
-		blockbody.MainHash = blockdetail.Block.MainHash
-		blockbody.MainHeight = blockdetail.Block.MainHeight
-	}
-
-	body, err := proto.Marshal(&blockbody)
+	hash := blockdetail.Block.Hash(cfg)
+	//存储区块body和header信息
+	err := bs.saveBlockForTable(storeBatch, blockdetail, true, true)
 	if err != nil {
-		storeLog.Error("SaveBlock Marshal blockbody", "height", height, "hash", common.ToHex(hash), "error", err)
+		storeLog.Error("SaveBlock:saveBlockForTable", "height", height, "hash", common.ToHex(hash), "error", err)
 		return lastSequence, err
 	}
-	storeBatch.Set(calcHashToBlockBodyKey(hash), body)
-
-	// Save blockheader通过block hash
-	var blockheader types.Header
-	blockheader.Version = blockdetail.Block.Version
-	blockheader.ParentHash = blockdetail.Block.ParentHash
-	blockheader.TxHash = blockdetail.Block.TxHash
-	blockheader.StateHash = blockdetail.Block.StateHash
-	blockheader.Height = blockdetail.Block.Height
-	blockheader.BlockTime = blockdetail.Block.BlockTime
-	blockheader.Signature = blockdetail.Block.Signature
-	blockheader.Difficulty = blockdetail.Block.Difficulty
-
-	blockheader.Hash = hash
-	blockheader.TxCount = int64(len(blockdetail.Block.Txs))
-
-	header, err := proto.Marshal(&blockheader)
-	if err != nil {
-		storeLog.Error("SaveBlock Marshal blockheader", "height", height, "hash", common.ToHex(hash), "error", err)
-		return lastSequence, err
-	}
-
-	storeBatch.Set(calcHashToBlockHeaderKey(hash), header)
-	storeBatch.Set(calcHeightToBlockHeaderKey(height), header)
-
 	//更新最新的block 高度
 	heightbytes := types.Encode(&types.Int64{Data: height})
 	storeBatch.Set(blockLastHeight, heightbytes)
 
 	//存储block hash和height的对应关系，便于通过hash查询block
-	storeBatch.Set(calcHashToHeightKey(hash), heightbytes)
+	//storeBatch.Set(calcHashToHeightKey(hash), heightbytes)
 
 	//存储block height和block hash的对应关系，便于通过height查询block
 	storeBatch.Set(calcHeightToHashKey(height), hash)
 
-	if bs.chain.isRecordBlockSequence || bs.chain.isParaChain {
+	if bs.saveSequence || bs.isParaChain {
 		//存储记录block序列执行的type add
-		lastSequence, err = bs.saveBlockSequence(storeBatch, hash, height, AddBlock, sequence)
+		lastSequence, err = bs.saveBlockSequence(storeBatch, hash, height, types.AddBlock, sequence)
 		if err != nil {
 			storeLog.Error("SaveBlock SaveBlockSequence", "height", height, "hash", common.ToHex(hash), "error", err)
 			return lastSequence, err
 		}
 	}
 	storeLog.Debug("SaveBlock success", "blockheight", height, "hash", common.ToHex(hash))
+
 	return lastSequence, nil
+}
+
+//BlockdetailToBlockBody get block detail
+func (bs *BlockStore) BlockdetailToBlockBody(blockdetail *types.BlockDetail) *types.BlockBody {
+	cfg := bs.client.GetConfig()
+	height := blockdetail.Block.Height
+	hash := blockdetail.Block.Hash(cfg)
+	var blockbody types.BlockBody
+	blockbody.Txs = blockdetail.Block.Txs
+	blockbody.Receipts = blockdetail.Receipts
+	blockbody.MainHash = hash
+	blockbody.MainHeight = height
+	blockbody.Hash = hash
+	blockbody.Height = height
+	if bs.isParaChain {
+		blockbody.MainHash = blockdetail.Block.MainHash
+		blockbody.MainHeight = blockdetail.Block.MainHeight
+	}
+	return &blockbody
 }
 
 //DelBlock 删除block信息从db数据库中
 func (bs *BlockStore) DelBlock(storeBatch dbm.Batch, blockdetail *types.BlockDetail, sequence int64) (int64, error) {
 	var lastSequence int64 = -1
 	height := blockdetail.Block.Height
-	hash := blockdetail.Block.Hash()
+	hash := blockdetail.Block.Hash(bs.client.GetConfig())
 
 	//更新最新的block高度为前一个高度
 	bytes := types.Encode(&types.Int64{Data: height - 1})
 	storeBatch.Set(blockLastHeight, bytes)
 
 	//删除block hash和height的对应关系
-	storeBatch.Delete(calcHashToHeightKey(hash))
+	//storeBatch.Delete(calcHashToHeightKey(hash))
 
 	//删除block height和block hash的对应关系，便于通过height查询block
 	storeBatch.Delete(calcHeightToHashKey(height))
-	storeBatch.Delete(calcHeightToBlockHeaderKey(height))
 
-	if bs.chain.isRecordBlockSequence || bs.chain.isParaChain {
+	if bs.saveSequence || bs.isParaChain {
 		//存储记录block序列执行的type del
-		lastSequence, err := bs.saveBlockSequence(storeBatch, hash, height, DelBlock, sequence)
+		lastSequence, err := bs.saveBlockSequence(storeBatch, hash, height, types.DelBlock, sequence)
 		if err != nil {
 			storeLog.Error("DelBlock SaveBlockSequence", "height", height, "hash", common.ToHex(hash), "error", err)
 			return lastSequence, err
 		}
 	}
-
+	// 删除主链上本区块存储的平行链标识，侧链的不记录
+	if !bs.isParaChain {
+		parakvs, _ := delParaTxTable(bs.db, height)
+		for _, kv := range parakvs {
+			if len(kv.GetKey()) != 0 && kv.GetValue() == nil {
+				storeBatch.Delete(kv.GetKey())
+			}
+		}
+	}
 	storeLog.Debug("DelBlock success", "blockheight", height, "hash", common.ToHex(hash))
 	return lastSequence, nil
 }
@@ -606,7 +653,8 @@ func (bs *BlockStore) GetTx(hash []byte) (*types.TxResult, error) {
 		err := errors.New("input hash is null")
 		return nil, err
 	}
-	rawBytes, err := bs.db.Get(types.CalcTxKey(hash))
+	cfg := bs.client.GetConfig()
+	rawBytes, err := bs.db.Get(cfg.CalcTxKey(hash))
 	if rawBytes == nil || err != nil {
 		if err != dbm.ErrNotFoundInDb {
 			storeLog.Error("GetTx", "hash", common.ToHex(hash), "err", err)
@@ -616,11 +664,51 @@ func (bs *BlockStore) GetTx(hash []byte) (*types.TxResult, error) {
 	}
 
 	var txResult types.TxResult
-	err = proto.Unmarshal(rawBytes, &txResult)
+	err = types.Decode(rawBytes, &txResult)
 	if err != nil {
 		return nil, err
 	}
-	return &txResult, nil
+	return bs.getRealTxResult(&txResult), nil
+}
+
+func (bs *BlockStore) getRealTxResult(txr *types.TxResult) *types.TxResult {
+	cfg := bs.client.GetConfig()
+	if !cfg.IsEnable("reduceLocaldb") {
+		return txr
+	}
+
+	var blockinfo *types.BlockDetail
+	var err error
+	var exist bool
+
+	//首先从缓存的活跃区块中获取，不存在时再从数据库获取并保存到活跃区块中供下次使用
+	hash, err := bs.GetBlockHashByHeight(txr.Height)
+	if err != nil {
+		chainlog.Error("getRealTxResult GetBlockHashByHeight", "height", txr.Height, "error", err)
+		return txr
+	}
+
+	blockinfo, exist = bs.GetActiveBlock(string(hash))
+	if !exist {
+		// 如果是精简版的localdb 则需要从block中获取tx交易内容以及receipt
+		blockinfo, err = bs.LoadBlockByHash(hash)
+		if err != nil {
+			chainlog.Error("getRealTxResult LoadBlockByHash", "height", txr.Height, "hash", common.ToHex(hash), "error", err)
+			return txr
+		}
+
+		//添加到活跃区块的缓存中
+		bs.AddActiveBlock(string(hash), blockinfo)
+	}
+
+	if int(txr.Index) < len(blockinfo.Block.Txs) {
+		txr.Tx = blockinfo.Block.Txs[txr.Index]
+	}
+	if int(txr.Index) < len(blockinfo.Receipts) {
+		txr.Receiptdate = blockinfo.Receipts[txr.Index]
+	}
+
+	return txr
 }
 
 //AddTxs 通过批量存储tx信息到db中
@@ -663,17 +751,17 @@ func (bs *BlockStore) DelTxs(storeBatch dbm.Batch, blockDetail *types.BlockDetai
 }
 
 //GetHeightByBlockHash 从db数据库中获取指定hash对应的block高度
-func (bs *BlockStore) GetHeightByBlockHash(hash []byte) (int64, error) {
-
-	heightbytes, err := bs.db.Get(calcHashToHeightKey(hash))
-	if heightbytes == nil || err != nil {
-		if err != dbm.ErrNotFoundInDb {
-			storeLog.Error("GetHeightByBlockHash", "error", err)
-		}
-		return -1, types.ErrHashNotExist
-	}
-	return decodeHeight(heightbytes)
-}
+//func (bs *BlockStore) GetHeightByBlockHash(hash []byte) (int64, error) {
+//
+//	heightbytes, err := bs.db.Get(calcHashToHeightKey(hash))
+//	if heightbytes == nil || err != nil {
+//		if err != dbm.ErrNotFoundInDb {
+//			storeLog.Error("GetHeightByBlockHash", "error", err)
+//		}
+//		return -1, types.ErrHashNotExist
+//	}
+//	return decodeHeight(heightbytes)
+//}
 
 func decodeHeight(heightbytes []byte) (int64, error) {
 	var height types.Int64
@@ -682,7 +770,7 @@ func decodeHeight(heightbytes []byte) (int64, error) {
 		//may be old database format json...
 		err = json.Unmarshal(heightbytes, &height.Data)
 		if err != nil {
-			storeLog.Error("GetHeightByBlockHash Could not unmarshal height bytes", "error", err)
+			storeLog.Error("decodeHeight could not unmarshal height bytes", "error", err)
 			return -1, types.ErrUnmarshal
 		}
 	}
@@ -692,6 +780,9 @@ func decodeHeight(heightbytes []byte) (int64, error) {
 //GetBlockHashByHeight 从db数据库中获取指定height对应的blockhash
 func (bs *BlockStore) GetBlockHashByHeight(height int64) ([]byte, error) {
 
+	if hash := bs.blockCache.GetBlockHash(height); len(hash) > 0 {
+		return hash, nil
+	}
 	hash, err := bs.db.Get(calcHeightToHashKey(height))
 	if hash == nil || err != nil {
 		if err != dbm.ErrNotFoundInDb {
@@ -703,58 +794,22 @@ func (bs *BlockStore) GetBlockHashByHeight(height int64) ([]byte, error) {
 }
 
 //GetBlockHeaderByHeight 通过blockheight获取blockheader
+//为了兼容旧版本的，需要先通过新的方式来获取，获取失败就使用旧的再获取一次
 func (bs *BlockStore) GetBlockHeaderByHeight(height int64) (*types.Header, error) {
-	//从最新版本的key里面获取header，找不到找老版本的数据库
-	blockheader, err := bs.db.Get(calcHeightToBlockHeaderKey(height))
-	var flagFoundInOldDB bool
-	if err != nil {
-		//首先通过height获取block hash从db中
-		var hash []byte
-		hash, err = bs.GetBlockHashByHeight(height)
-		if err != nil {
-			return nil, err
-		}
-		blockheader, err = bs.db.Get(calcHashToBlockHeaderKey(hash))
-		flagFoundInOldDB = true
-	}
-	if blockheader == nil || err != nil {
-		if err != dbm.ErrNotFoundInDb {
-			storeLog.Error("GetBlockHeaderByHeight calcHashToBlockHeaderKey", "error", err)
-		}
-		return nil, types.ErrHashNotExist
-	}
-	var header types.Header
-	err = proto.Unmarshal(blockheader, &header)
-	if err != nil {
-		storeLog.Error("GetBlockHerderByHeight", "Could not unmarshal blockheader:", blockheader)
-		return nil, err
-	}
-	if flagFoundInOldDB {
-		err = bs.db.Set(calcHeightToBlockHeaderKey(height), blockheader)
-		if err != nil {
-			storeLog.Error("GetBlockHeaderByHeight Set ", "height", height, "err", err)
-		}
-	}
-	return &header, nil
+	return bs.loadHeaderByIndex(height)
 }
 
 //GetBlockHeaderByHash 通过blockhash获取blockheader
 func (bs *BlockStore) GetBlockHeaderByHash(hash []byte) (*types.Header, error) {
-
-	var header types.Header
-	blockheader, err := bs.db.Get(calcHashToBlockHeaderKey(hash))
-	if blockheader == nil || err != nil {
+	//使用table的方式获取，hash索引查table表获取
+	header, err := getHeaderByIndex(bs.db, "hash", hash, nil)
+	if header == nil || err != nil {
 		if err != dbm.ErrNotFoundInDb {
-			storeLog.Error("GetBlockHerderByHash calcHashToBlockHeaderKey ", "err", err)
+			storeLog.Error("GetBlockHerderByHash:getHeaderByIndex ", "err", err)
 		}
 		return nil, types.ErrHashNotExist
 	}
-	err = proto.Unmarshal(blockheader, &header)
-	if err != nil {
-		storeLog.Error("GetBlockHerderByHash", "err", err)
-		return nil, err
-	}
-	return &header, nil
+	return header, nil
 }
 
 func (bs *BlockStore) getLocalKV(detail *types.BlockDetail) (*types.LocalDBSet, error) {
@@ -835,57 +890,40 @@ func LoadBlockStoreHeight(db dbm.DB) (int64, error) {
 
 // 将收到的block都暂时存储到db中，加入主链之后会重新覆盖。主要是用于chain重组时获取侧链的block使用
 func (bs *BlockStore) dbMaybeStoreBlock(blockdetail *types.BlockDetail, sync bool) error {
+	// 对于不回滚的共识, 预存储可能带来额外开销
+	if bs.chain.neverRollback {
+		return nil
+	}
 	if blockdetail == nil {
 		return types.ErrInvalidParam
 	}
 	height := blockdetail.Block.GetHeight()
-	hash := blockdetail.Block.Hash()
-	storeBatch := bs.NewBatch(sync)
+	hash := blockdetail.Block.Hash(bs.client.GetConfig())
 
-	// Save blockbody通过block hash
-	var blockbody types.BlockBody
-	blockbody.Txs = blockdetail.Block.Txs
-	blockbody.Receipts = blockdetail.Receipts
-	blockbody.MainHash = hash
-	blockbody.MainHeight = height
-	if types.IsPara() {
-		blockbody.MainHash = blockdetail.Block.MainHash
-		blockbody.MainHeight = blockdetail.Block.MainHeight
+	// 检测数据库中是否存在，通过hash获取blockheader，存在说明已经保存过了，有两种可能:
+	// 1. 只执行了maybeStoreBlock，没有保存到主链(可能重启了)，则可以跳过此保存
+	// 2. 执行了maybeStoreBlock,也执行了主链，但是又被回滚了，处于侧链，则也可以跳过此临时保存，而继续去connect,验证分叉
+	// 对于2，被回滚的区块重新被广播到，而且系统重启之后，index里面没有缓存，blockExists就会认为此hash不存在，而执行dbMaybeStoreBlock, 导致receipts等信息丢失
+	blockheader, _ := bs.GetBlockHeaderByHash(hash)
+	if blockheader != nil {
+		chainlog.Info("dbMaybeStoreBlock block header existed", "hash", common.ToHex(hash))
+		return nil
 	}
-	body, err := proto.Marshal(&blockbody)
+
+	storeBatch := bs.batch
+	storeBatch.Reset()
+	storeBatch.UpdateWriteSync(sync)
+	//Save block header和body使用table形式存储
+	err := bs.saveBlockForTable(storeBatch, blockdetail, false, true)
 	if err != nil {
-		storeLog.Error("dbMaybeStoreBlock Marshal blockbody", "height", height, "hash", common.ToHex(hash), "error", err)
-		return types.ErrMarshal
+		chainlog.Error("dbMaybeStoreBlock:saveBlockForTable", "height", height, "hash", common.ToHex(hash), "err", err)
+		return err
 	}
-	storeBatch.Set(calcHashToBlockBodyKey(hash), body)
-
-	// Save blockheader通过block hash
-	var blockheader types.Header
-	blockheader.Version = blockdetail.Block.Version
-	blockheader.ParentHash = blockdetail.Block.ParentHash
-	blockheader.TxHash = blockdetail.Block.TxHash
-	blockheader.StateHash = blockdetail.Block.StateHash
-	blockheader.Height = blockdetail.Block.Height
-	blockheader.BlockTime = blockdetail.Block.BlockTime
-	blockheader.Signature = blockdetail.Block.Signature
-	blockheader.Difficulty = blockdetail.Block.Difficulty
-	blockheader.Hash = hash
-	blockheader.TxCount = int64(len(blockdetail.Block.Txs))
-
-	header, err := proto.Marshal(&blockheader)
-	if err != nil {
-		storeLog.Error("dbMaybeStoreBlock Marshal blockheader", "height", height, "hash", common.ToHex(hash), "error", err)
-		return types.ErrMarshal
-	}
-	storeBatch.Set(calcHashToBlockHeaderKey(hash), header)
-
 	//保存block的总难度到db中
 	parentHash := blockdetail.Block.ParentHash
 
 	//转换自己的难度成big.int
 	difficulty := difficulty.CalcWork(blockdetail.Block.Difficulty)
-	//chainlog.Error("dbMaybeStoreBlock Difficulty", "height", height, "Block.Difficulty", blockdetail.Block.Difficulty)
-	//chainlog.Error("dbMaybeStoreBlock Difficulty bigint", "height", height, "self.Difficulty", difficulty.BigToCompact(difficulty))
 
 	var blocktd *big.Int
 	if height == 0 {
@@ -897,11 +935,9 @@ func (bs *BlockStore) dbMaybeStoreBlock(blockdetail *types.BlockDetail, sync boo
 			return err
 		}
 		blocktd = new(big.Int).Add(difficulty, parenttd)
-		//chainlog.Error("dbMaybeStoreBlock Difficulty", "height", height, "parenttd.td", difficulty.BigToCompact(parenttd))
-		//chainlog.Error("dbMaybeStoreBlock Difficulty", "height", height, "self.td", difficulty.BigToCompact(blocktd))
 	}
 
-	err = bs.SaveTdByBlockHash(storeBatch, blockdetail.Block.Hash(), blocktd)
+	err = bs.SaveTdByBlockHash(storeBatch, blockdetail.Block.Hash(bs.client.GetConfig()), blocktd)
 	if err != nil {
 		chainlog.Error("dbMaybeStoreBlock SaveTdByBlockHash:", "height", height, "hash", common.ToHex(hash), "err", err)
 		return err
@@ -910,14 +946,15 @@ func (bs *BlockStore) dbMaybeStoreBlock(blockdetail *types.BlockDetail, sync boo
 	err = storeBatch.Write()
 	if err != nil {
 		chainlog.Error("dbMaybeStoreBlock storeBatch.Write:", "err", err)
-		return types.ErrDataBaseDamage
+		panic(err)
 	}
 	return nil
 }
 
 //LoadBlockLastSequence 获取当前最新的block操作序列号
 func (bs *BlockStore) LoadBlockLastSequence() (int64, error) {
-	bytes, err := bs.db.Get(LastSequence)
+	lastKey := calcLastSeqKey(bs.isParaChain)
+	bytes, err := bs.db.Get(lastKey)
 	if bytes == nil || err != nil {
 		if err != dbm.ErrNotFoundInDb {
 			storeLog.Error("LoadBlockLastSequence", "error", err)
@@ -927,37 +964,27 @@ func (bs *BlockStore) LoadBlockLastSequence() (int64, error) {
 	return decodeHeight(bytes)
 }
 
-func (bs *BlockStore) setSeqCBLastNum(name []byte, num int64) error {
-	return bs.db.SetSync(caclSeqCBLastNumKey(name), types.Encode(&types.Int64{Data: num}))
-}
-
-//Seq的合法值从0开始的，所以没有获取到或者获取失败都应该返回-1
-func (bs *BlockStore) getSeqCBLastNum(name []byte) int64 {
-	bytes, err := bs.db.Get(caclSeqCBLastNumKey(name))
+//LoadBlockLastMainSequence 获取当前最新的block操作序列号
+func (bs *BlockStore) LoadBlockLastMainSequence() (int64, error) {
+	bytes, err := bs.db.Get(LastSequence)
 	if bytes == nil || err != nil {
 		if err != dbm.ErrNotFoundInDb {
-			storeLog.Error("getSeqCBLastNum", "error", err)
+			storeLog.Error("LoadBlockLastMainSequence", "error", err)
 		}
-		return -1
+		return -1, types.ErrHeightNotExist
 	}
-	n, err := decodeHeight(bytes)
-	if err != nil {
-		return -1
-	}
-	storeLog.Error("getSeqCBLastNum", "name", string(name), "num", n)
-
-	return n
+	return decodeHeight(bytes)
 }
 
 //SaveBlockSequence 存储block 序列执行的类型用于blockchain的恢复
-//获取当前的序列号，将此序列号加1存储本block的hash ，当主链使能isRecordBlockSequence
-// 平行链使能isParaChain时，sequence序列号是传入的
+//获取当前的序列号，将此序列号加1存储本block的hash ，当使能isRecordBlockSequence
+//平行链使能isParaChain时，而外保存主链的 sequence
+// 需要保存
+// seq->hash, hash->seq, last_seq
+// 平行链需要主链的对应信息
 func (bs *BlockStore) saveBlockSequence(storeBatch dbm.Batch, hash []byte, height int64, Type int64, sequence int64) (int64, error) {
-
-	var blockSequence types.BlockSequence
 	var newSequence int64
-
-	if bs.chain.isRecordBlockSequence {
+	if bs.saveSequence {
 		Sequence, err := bs.LoadBlockLastSequence()
 		if err != nil {
 			storeLog.Error("SaveBlockSequence", "LoadBlockLastSequence err", err)
@@ -969,31 +996,44 @@ func (bs *BlockStore) saveBlockSequence(storeBatch dbm.Batch, hash []byte, heigh
 		newSequence = Sequence + 1
 		//开启isRecordBlockSequence功能必须从0开始同步数据，不允许从非0高度开启此功能
 		if newSequence == 0 && height != 0 {
-			storeLog.Error("isRecordBlockSequence is true must Synchronizing data from zero block", "height", height)
+			storeLog.Error("isRecordBlockSequence is true must Synchronizing data from zero block", "height", height, "seq", newSequence)
 			panic(errors.New("isRecordBlockSequence is true must Synchronizing data from zero block"))
 		}
-	} else if bs.chain.isParaChain {
-		newSequence = sequence
+
+		// seq->hash
+		var blockSequence types.BlockSequence
+		blockSequence.Hash = hash
+		blockSequence.Type = Type
+		BlockSequenceByte := types.Encode(&blockSequence)
+		storeBatch.Set(calcSequenceToHashKey(newSequence, bs.isParaChain), BlockSequenceByte)
+
+		sequenceBytes := types.Encode(&types.Int64{Data: newSequence})
+		// hash->seq 只记录add block时的hash和seq对应关系
+		if Type == types.AddBlock {
+			storeBatch.Set(calcHashToSequenceKey(hash, bs.isParaChain), sequenceBytes)
+		}
+
+		// 记录last seq
+		storeBatch.Set(calcLastSeqKey(bs.isParaChain), sequenceBytes)
 	}
+
+	if !bs.isParaChain {
+		return newSequence, nil
+	}
+
+	mainSeq := sequence
+	var blockSequence types.BlockSequence
 	blockSequence.Hash = hash
 	blockSequence.Type = Type
+	BlockSequenceByte := types.Encode(&blockSequence)
+	storeBatch.Set(calcMainSequenceToHashKey(mainSeq), BlockSequenceByte)
 
-	BlockSequenceByte, err := proto.Marshal(&blockSequence)
-	if err != nil {
-		storeLog.Error("SaveBlockSequence Marshal BlockSequence", "hash", common.ToHex(hash), "error", err)
-		return newSequence, err
+	// hash->seq 只记录add block时的hash和seq对应关系
+	sequenceBytes := types.Encode(&types.Int64{Data: mainSeq})
+	if Type == types.AddBlock {
+		storeBatch.Set(calcHashToMainSequenceKey(hash), sequenceBytes)
 	}
-
-	// seq->hash
-	storeBatch.Set(calcSequenceToHashKey(newSequence), BlockSequenceByte)
-
-	//parachain  hash->seq 只记录add block时的hash和seq对应关系
-	if Type == AddBlock {
-		Sequencebytes := types.Encode(&types.Int64{Data: newSequence})
-		storeBatch.Set(calcHashToSequenceKey(hash), Sequencebytes)
-	}
-	Sequencebytes := types.Encode(&types.Int64{Data: newSequence})
-	storeBatch.Set(LastSequence, Sequencebytes)
+	storeBatch.Set(LastSequence, sequenceBytes)
 
 	return newSequence, nil
 }
@@ -1008,11 +1048,20 @@ func (bs *BlockStore) LoadBlockBySequence(Sequence int64) (*types.BlockDetail, i
 	return bs.loadBlockByHash(BlockSequence.Hash)
 }
 
+//LoadBlockByMainSequence 通过main seq高度获取BlockDetail信息
+func (bs *BlockStore) LoadBlockByMainSequence(sequence int64) (*types.BlockDetail, int, error) {
+	//首先通过Sequence序列号获取对应的blockhash和操作类型从db中
+	BlockSequence, err := bs.GetBlockByMainSequence(sequence)
+	if err != nil {
+		return nil, 0, err
+	}
+	return bs.loadBlockByHash(BlockSequence.Hash)
+}
+
 //GetBlockSequence 从db数据库中获取指定Sequence对应的block序列操作信息
 func (bs *BlockStore) GetBlockSequence(Sequence int64) (*types.BlockSequence, error) {
-
 	var blockSeq types.BlockSequence
-	blockSeqByte, err := bs.db.Get(calcSequenceToHashKey(Sequence))
+	blockSeqByte, err := bs.db.Get(calcSequenceToHashKey(Sequence, bs.isParaChain))
 	if blockSeqByte == nil || err != nil {
 		if err != dbm.ErrNotFoundInDb {
 			storeLog.Error("GetBlockSequence", "error", err)
@@ -1020,7 +1069,7 @@ func (bs *BlockStore) GetBlockSequence(Sequence int64) (*types.BlockSequence, er
 		return nil, types.ErrHeightNotExist
 	}
 
-	err = proto.Unmarshal(blockSeqByte, &blockSeq)
+	err = types.Decode(blockSeqByte, &blockSeq)
 	if err != nil {
 		storeLog.Error("GetBlockSequence", "err", err)
 		return nil, err
@@ -1028,10 +1077,29 @@ func (bs *BlockStore) GetBlockSequence(Sequence int64) (*types.BlockSequence, er
 	return &blockSeq, nil
 }
 
-//GetSequenceByHash 通过block还是获取对应的seq，只提供给parachain使用
+//GetBlockByMainSequence 从db数据库中获取指定Sequence对应的block序列操作信息
+func (bs *BlockStore) GetBlockByMainSequence(sequence int64) (*types.BlockSequence, error) {
+	var blockSeq types.BlockSequence
+	blockSeqByte, err := bs.db.Get(calcMainSequenceToHashKey(sequence))
+	if blockSeqByte == nil || err != nil {
+		if err != dbm.ErrNotFoundInDb {
+			storeLog.Error("GetBlockByMainSequence", "error", err)
+		}
+		return nil, types.ErrHeightNotExist
+	}
+
+	err = types.Decode(blockSeqByte, &blockSeq)
+	if err != nil {
+		storeLog.Error("GetBlockByMainSequence", "err", err)
+		return nil, err
+	}
+	return &blockSeq, nil
+}
+
+//GetSequenceByHash 通过block还是获取对应的seq
 func (bs *BlockStore) GetSequenceByHash(hash []byte) (int64, error) {
 	var seq types.Int64
-	seqbytes, err := bs.db.Get(calcHashToSequenceKey(hash))
+	seqbytes, err := bs.db.Get(calcHashToSequenceKey(hash, bs.isParaChain))
 	if seqbytes == nil || err != nil {
 		if err != dbm.ErrNotFoundInDb {
 			storeLog.Error("GetSequenceByHash", "error", err)
@@ -1042,6 +1110,25 @@ func (bs *BlockStore) GetSequenceByHash(hash []byte) (int64, error) {
 	err = types.Decode(seqbytes, &seq)
 	if err != nil {
 		storeLog.Error("GetSequenceByHash  types.Decode", "error", err)
+		return -1, types.ErrUnmarshal
+	}
+	return seq.Data, nil
+}
+
+//GetMainSequenceByHash 通过block还是获取对应的seq，只提供给parachain使用
+func (bs *BlockStore) GetMainSequenceByHash(hash []byte) (int64, error) {
+	var seq types.Int64
+	seqbytes, err := bs.db.Get(calcHashToMainSequenceKey(hash))
+	if seqbytes == nil || err != nil {
+		if err != dbm.ErrNotFoundInDb {
+			storeLog.Error("GetMainSequenceByHash", "error", err)
+		}
+		return -1, types.ErrHashNotExist
+	}
+
+	err = types.Decode(seqbytes, &seq)
+	if err != nil {
+		storeLog.Error("GetMainSequenceByHash  types.Decode", "error", err)
 		return -1, types.ErrUnmarshal
 	}
 	return seq.Data, nil
@@ -1092,7 +1179,7 @@ func (bs *BlockStore) GetUpgradeMeta() (*types.UpgradeMeta, error) {
 	if err != nil {
 		return nil, err
 	}
-	storeLog.Info("GetUpgradeMeta", "blockchain db version", ver)
+	storeLog.Info("GetUpgradeMeta", "blockchain db version", ver.String())
 	return &ver, nil
 }
 
@@ -1117,57 +1204,595 @@ func (bs *BlockStore) GetStoreUpgradeMeta() (*types.UpgradeMeta, error) {
 	if err != nil {
 		return nil, err
 	}
-	storeLog.Info("GetStoreUpgradeMeta", "blockchain db version", ver)
+	storeLog.Info("GetStoreUpgradeMeta", "blockchain db version", ver.String())
 	return &ver, nil
 }
 
 //SetStoreUpgradeMeta 设置blockchain中的Store的数据库版本号
 func (bs *BlockStore) SetStoreUpgradeMeta(meta *types.UpgradeMeta) error {
 	verByte := types.Encode(meta)
-	storeLog.Info("SetStoreUpgradeMeta", "meta", meta)
+	storeLog.Debug("SetStoreUpgradeMeta", "meta", meta)
 	return bs.db.SetSync(version.StoreDBMeta, verByte)
 }
 
-//isRecordBlockSequence配置的合法性检测
-func (bs *BlockStore) isRecordBlockSequenceValid(chain *BlockChain) {
+const (
+	seqStatusOk = iota
+	seqStatusNeedCreate
+)
+
+//CheckSequenceStatus 配置的合法性检测
+func (bs *BlockStore) CheckSequenceStatus(recordSequence bool) int {
 	lastHeight := bs.Height()
 	lastSequence, err := bs.LoadBlockLastSequence()
 	if err != nil {
 		if err != types.ErrHeightNotExist {
-			storeLog.Error("isRecordBlockSequenceValid", "LoadBlockLastSequence err", err)
+			storeLog.Error("CheckSequenceStatus", "LoadBlockLastSequence err", err)
 			panic(err)
 		}
 	}
 	//使能isRecordBlockSequence时的检测
-	if chain.isRecordBlockSequence {
+	if recordSequence {
 		//中途开启isRecordBlockSequence报错
 		if lastSequence == -1 && lastHeight != -1 {
-			storeLog.Error("isRecordBlockSequenceValid", "lastHeight", lastHeight, "lastSequence", lastSequence)
-			panic("isRecordBlockSequence is true must Synchronizing data from zero block")
+			storeLog.Error("CheckSequenceStatus", "lastHeight", lastHeight, "lastSequence", lastSequence)
+			return seqStatusNeedCreate
 		}
 		//lastSequence 必须大于等于lastheight
 		if lastHeight > lastSequence {
-			storeLog.Error("isRecordBlockSequenceValid", "lastHeight", lastHeight, "lastSequence", lastSequence)
-			panic("lastSequence must greater than or equal to lastHeight")
+			storeLog.Error("CheckSequenceStatus", "lastHeight", lastHeight, "lastSequence", lastSequence)
+			return seqStatusNeedCreate
 		}
-		//通过lastSequence获取对应的blockhash ！= lastHeader.hash 报错
-		if lastSequence != -1 {
-			blockSequence, err := bs.GetBlockSequence(lastSequence)
-			if err != nil {
-				storeLog.Error("isRecordBlockSequenceValid", "lastSequence", lastSequence, "GetBlockSequence err", err)
-				panic(err)
-			}
-			lastHeader := bs.LastHeader()
-			if !bytes.Equal(lastHeader.Hash, blockSequence.Hash) {
-				storeLog.Error("isRecordBlockSequenceValid:", "lastHeight", lastHeight, "lastSequence", lastSequence, "lastHeader.Hash", common.ToHex(lastHeader.Hash), "blockSequence.Hash", common.ToHex(blockSequence.Hash))
-				panic("The hash values of lastSequence and lastHeight are different.")
-			}
-		}
-		return
+		return seqStatusOk
 	}
 	//去使能isRecordBlockSequence时的检测
 	if lastSequence != -1 {
-		storeLog.Error("isRecordBlockSequenceValid", "lastSequence", lastSequence)
+		storeLog.Error("CheckSequenceStatus", "lastSequence", lastSequence)
 		panic("can not disable isRecordBlockSequence")
 	}
+	return seqStatusOk
+}
+
+//CreateSequences 根据高度生成sequence记录
+func (bs *BlockStore) CreateSequences(batchSize int64) {
+	lastSeq, err := bs.LoadBlockLastSequence()
+	if err != nil {
+		if err != types.ErrHeightNotExist {
+			storeLog.Error("CreateSequences LoadBlockLastSequence", "error", err)
+			panic("CreateSequences LoadBlockLastSequence" + err.Error())
+		}
+	}
+	storeLog.Info("CreateSequences LoadBlockLastSequence", "start", lastSeq)
+
+	newBatch := bs.NewBatch(true)
+	lastHeight := bs.Height()
+
+	for i := lastSeq + 1; i <= lastHeight; i++ {
+		seq := i
+		header, err := bs.GetBlockHeaderByHeight(i)
+		if err != nil {
+			storeLog.Error("CreateSequences GetBlockHeaderByHeight", "height", i, "error", err)
+			panic("CreateSequences GetBlockHeaderByHeight" + err.Error())
+		}
+
+		// seq->hash
+		var blockSequence types.BlockSequence
+		blockSequence.Hash = header.Hash
+		blockSequence.Type = types.AddBlock
+		BlockSequenceByte := types.Encode(&blockSequence)
+		newBatch.Set(calcSequenceToHashKey(seq, bs.isParaChain), BlockSequenceByte)
+
+		// hash -> seq
+		sequenceBytes := types.Encode(&types.Int64{Data: seq})
+		newBatch.Set(calcHashToSequenceKey(header.Hash, bs.isParaChain), sequenceBytes)
+
+		if i-lastSeq == batchSize {
+			storeLog.Info("CreateSequences ", "height", i)
+			newBatch.Set(calcLastSeqKey(bs.isParaChain), types.Encode(&types.Int64{Data: i}))
+			err = newBatch.Write()
+			if err != nil {
+				storeLog.Error("CreateSequences newBatch.Write", "error", err)
+				panic("CreateSequences newBatch.Write" + err.Error())
+			}
+			lastSeq = i
+			newBatch.Reset()
+		}
+	}
+	// last seq
+	newBatch.Set(calcLastSeqKey(bs.isParaChain), types.Encode(&types.Int64{Data: lastHeight}))
+	err = newBatch.Write()
+	if err != nil {
+		storeLog.Error("CreateSequences newBatch.Write", "error", err)
+		panic("CreateSequences newBatch.Write" + err.Error())
+	}
+	storeLog.Info("CreateSequences done")
+}
+
+//SetConsensusPara 设置kv到数据库,当value是空时需要delete操作
+func (bs *BlockStore) SetConsensusPara(kvs *types.LocalDBSet) error {
+	var isSync bool
+	if kvs.GetTxid() != 0 {
+		isSync = true
+	}
+	batch := bs.db.NewBatch(isSync)
+	for i := 0; i < len(kvs.KV); i++ {
+		if types.CheckConsensusParaTxsKey(kvs.KV[i].Key) {
+			if kvs.KV[i].Value == nil {
+				batch.Delete(kvs.KV[i].Key)
+			} else {
+				batch.Set(kvs.KV[i].Key, kvs.KV[i].Value)
+			}
+		} else {
+			storeLog.Error("Set:CheckConsensusParaTxsKey:fail", "key", string(kvs.KV[i].Key))
+		}
+	}
+	err := batch.Write()
+	if err != nil {
+		panic(err)
+	}
+	return err
+}
+
+//saveBlockForTable 将block的header和body以及paratx保存成table形式，方便快速查询
+func (bs *BlockStore) saveBlockForTable(storeBatch dbm.Batch, blockdetail *types.BlockDetail, isBestChain, isSaveReceipt bool) error {
+
+	height := blockdetail.Block.Height
+	cfg := bs.client.GetConfig()
+	hash := blockdetail.Block.Hash(cfg)
+
+	// Save blockbody
+	blockbody := bs.BlockdetailToBlockBody(blockdetail)
+	// 这里将blockbody进行中的receipt拆分成独立的一张表,
+	// 因此body中只保存Receipts的结果，具体内容在ReceiptTable中
+	blockbody.Receipts = reduceReceipts(blockbody)
+	bodykvs, err := saveBlockBodyTable(bs.db, blockbody)
+	if err != nil {
+		storeLog.Error("SaveBlockForTable:saveBlockBodyTable", "height", height, "hash", common.ToHex(hash), "err", err)
+		return err
+	}
+	for _, kv := range bodykvs {
+		storeBatch.Set(kv.GetKey(), kv.GetValue())
+	}
+
+	// Save blockReceipt
+	if isSaveReceipt {
+		blockReceipt := &types.BlockReceipt{
+			Receipts: blockdetail.Receipts,
+			Hash:     hash,
+			Height:   height,
+		}
+		recptkvs, err := saveBlockReceiptTable(bs.db, blockReceipt)
+		if err != nil {
+			storeLog.Error("SaveBlockForTable:saveBlockReceiptTable", "height", height, "hash", common.ToHex(hash), "err", err)
+			return err
+		}
+		for _, kv := range recptkvs {
+			storeBatch.Set(kv.GetKey(), kv.GetValue())
+		}
+	}
+
+	// Save blockheader
+	var blockheader types.Header
+	blockheader.Version = blockdetail.Block.Version
+	blockheader.ParentHash = blockdetail.Block.ParentHash
+	blockheader.TxHash = blockdetail.Block.TxHash
+	blockheader.StateHash = blockdetail.Block.StateHash
+	blockheader.Height = blockdetail.Block.Height
+	blockheader.BlockTime = blockdetail.Block.BlockTime
+	blockheader.Signature = blockdetail.Block.Signature
+	blockheader.Difficulty = blockdetail.Block.Difficulty
+	blockheader.Hash = hash
+	blockheader.TxCount = int64(len(blockdetail.Block.Txs))
+
+	headerkvs, err := saveHeaderTable(bs.db, &blockheader)
+	if err != nil {
+		storeLog.Error("SaveBlock:saveHeaderTable", "height", height, "hash", common.ToHex(hash), "err", err)
+		return err
+	}
+	for _, kv := range headerkvs {
+		storeBatch.Set(kv.GetKey(), kv.GetValue())
+	}
+
+	//只过滤主链上的平行链交易
+	if isBestChain && !bs.isParaChain {
+		paratxkvs, err := saveParaTxTable(cfg, bs.db, height, hash, blockdetail.Block.Txs)
+		if err != nil {
+			storeLog.Error("SaveBlock:saveParaTxTable", "height", height, "hash", common.ToHex(hash), "err", err)
+			return err
+		}
+		for _, kv := range paratxkvs {
+			storeBatch.Set(kv.GetKey(), kv.GetValue())
+		}
+	}
+	return nil
+}
+
+//loadBlockByIndex 通过索引获取BlockDetail信息
+func (bs *BlockStore) loadBlockByIndex(indexName string, prefix []byte, primaryKey []byte) (*types.BlockDetail, error) {
+	cfg := bs.client.GetConfig()
+	//获取header
+	blockheader, err := getHeaderByIndex(bs.db, indexName, prefix, primaryKey)
+	if blockheader == nil || err != nil {
+		if err != dbm.ErrNotFoundInDb {
+			storeLog.Error("loadBlockByIndex:getHeaderByIndex", "indexName", indexName, "prefix", prefix, "primaryKey", primaryKey, "err", err)
+		}
+		return nil, types.ErrHashNotExist
+	}
+
+	//获取body
+	blockbody, err := bs.multiGetBody(blockheader, indexName, prefix, primaryKey)
+	if blockbody == nil || err != nil {
+		return nil, err
+	}
+
+	blockreceipt := blockbody.Receipts
+	// 非精简节点查询时候需要在ReceiptTable中获取详细的receipt信息, 精简情况下可以获取未精简部分receipt
+	if !cfg.IsEnable("reduceLocaldb") || bs.Height() < blockheader.Height+ReduceHeight {
+		receipt, err := getReceiptByIndex(bs.db, indexName, prefix, primaryKey)
+		if receipt != nil {
+			blockreceipt = receipt.Receipts
+		} else {
+			storeLog.Error("loadBlockByIndex:getReceiptByIndex", "indexName", indexName, "prefix", prefix, "primaryKey", primaryKey, "err", err)
+			if !cfg.IsEnable("reduceLocaldb") {
+				return nil, types.ErrHashNotExist
+			}
+		}
+	}
+
+	var blockdetail types.BlockDetail
+	var block types.Block
+
+	block.Version = blockheader.Version
+	block.ParentHash = blockheader.ParentHash
+	block.TxHash = blockheader.TxHash
+	block.StateHash = blockheader.StateHash
+	block.Height = blockheader.Height
+	block.BlockTime = blockheader.BlockTime
+	block.Signature = blockheader.Signature
+	block.Difficulty = blockheader.Difficulty
+	block.Txs = blockbody.Txs
+	block.MainHeight = blockbody.MainHeight
+	block.MainHash = blockbody.MainHash
+
+	blockdetail.Receipts = blockreceipt
+	blockdetail.Block = &block
+	return &blockdetail, nil
+}
+
+//loadHeaderByIndex 通过索引获取区块头信息
+func (bs *BlockStore) loadHeaderByIndex(height int64) (*types.Header, error) {
+
+	hash, err := bs.GetBlockHashByHeight(height)
+	if err != nil {
+		return nil, err
+	}
+
+	header, err := getHeaderByIndex(bs.db, "", calcHeightHashKey(height, hash), nil)
+	if header == nil || err != nil {
+		if err != dbm.ErrNotFoundInDb {
+			storeLog.Error("loadHeaderByHeight:getHeaderByIndex", "error", err)
+		}
+		return nil, types.ErrHashNotExist
+	}
+	return header, nil
+}
+
+//loadBlockByHashOld 需要在db升级之前使用旧的key值获取block信息
+func (bs *BlockStore) loadBlockByHashOld(hash []byte) (*types.BlockDetail, error) {
+	var blockdetail types.BlockDetail
+	var blockheader types.Header
+	var blockbody types.BlockBody
+	var block types.Block
+
+	//通过hash获取blockheader
+	header, err := bs.db.Get(calcHashToBlockHeaderKey(hash))
+	if header == nil || err != nil {
+		if err != dbm.ErrNotFoundInDb {
+			storeLog.Error("loadBlockByHashOld:calcHashToBlockHeaderKey", "hash", common.ToHex(hash), "err", err)
+		}
+		return nil, types.ErrHashNotExist
+	}
+	err = types.Decode(header, &blockheader)
+	if err != nil {
+		storeLog.Error("loadBlockByHashOld", "err", err)
+		return nil, err
+	}
+
+	//通过hash获取blockbody
+	body, err := bs.db.Get(calcHashToBlockBodyKey(hash))
+	if body == nil || err != nil {
+		if err != dbm.ErrNotFoundInDb {
+			storeLog.Error("loadBlockByHashOld:calcHashToBlockBodyKey ", "err", err)
+		}
+		return nil, types.ErrHashNotExist
+	}
+	err = types.Decode(body, &blockbody)
+	if err != nil {
+		storeLog.Error("loadBlockByHashOld", "err", err)
+		return nil, err
+	}
+
+	block.Version = blockheader.Version
+	block.ParentHash = blockheader.ParentHash
+	block.TxHash = blockheader.TxHash
+	block.StateHash = blockheader.StateHash
+	block.Height = blockheader.Height
+	block.BlockTime = blockheader.BlockTime
+	block.Signature = blockheader.Signature
+	block.Difficulty = blockheader.Difficulty
+	block.Txs = blockbody.Txs
+	block.MainHeight = blockbody.MainHeight
+	block.MainHash = blockbody.MainHash
+	blockdetail.Receipts = blockbody.Receipts
+	blockdetail.Block = &block
+
+	return &blockdetail, nil
+}
+
+//loadBlockByHeightOld 在版本升级到2.0.0时需要使用旧接口获取block信息
+func (bs *BlockStore) loadBlockByHeightOld(height int64) (*types.BlockDetail, error) {
+	hash, err := bs.GetBlockHashByHeight(height)
+	if err != nil {
+		return nil, err
+	}
+	return bs.loadBlockByHashOld(hash)
+}
+
+//getBlockHeaderByHeightOld 需要在db升级之前使用旧的key值获取header信息
+func (bs *BlockStore) getBlockHeaderByHeightOld(height int64) (*types.Header, error) {
+	blockheader, err := bs.db.Get(calcHeightToBlockHeaderKey(height))
+	if err != nil {
+		var hash []byte
+		hash, err = bs.GetBlockHashByHeight(height)
+		if err != nil {
+			return nil, err
+		}
+		blockheader, err = bs.db.Get(calcHashToBlockHeaderKey(hash))
+	}
+	if blockheader == nil || err != nil {
+		if err != dbm.ErrNotFoundInDb {
+			storeLog.Error("getBlockHeaderByHeightOld:calcHashToBlockHeaderKey", "error", err)
+		}
+		return nil, types.ErrHashNotExist
+	}
+	var header types.Header
+	err = types.Decode(blockheader, &header)
+	if err != nil {
+		storeLog.Error("getBlockHeaderByHeightOld", "Could not unmarshal blockheader:", blockheader)
+		return nil, err
+	}
+	return &header, nil
+}
+
+//loadBlockBySequenceOld 通过seq高度获取BlockDetail信息,v2版本升级时调用
+//可能存在回滚的处理，所以先查旧的，查抄不到就按新的方式再查
+func (bs *BlockStore) loadBlockBySequenceOld(Sequence int64) (*types.BlockDetail, int64, error) {
+
+	blockSeq, err := bs.GetBlockSequence(Sequence)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	block, err := bs.loadBlockByHashOld(blockSeq.Hash)
+	if err != nil {
+		block, err = bs.LoadBlockByHash(blockSeq.Hash)
+		if err != nil {
+			storeLog.Error("getBlockHeaderByHeightOld", "Sequence", Sequence, "type", blockSeq.Type, "hash", common.ToHex(blockSeq.Hash), "err", err)
+			panic(err)
+		}
+	}
+	return block, blockSeq.GetType(), nil
+}
+
+func (bs *BlockStore) saveReduceLocaldbFlag() {
+	kv := types.FlagKV(types.FlagReduceLocaldb, 1)
+	err := bs.db.Set(kv.Key, kv.Value)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (bs *BlockStore) mustSaveKvset(kv *types.LocalDBSet) {
+	batch := bs.NewBatch(false)
+	for i := 0; i < len(kv.KV); i++ {
+		if kv.KV[i].Value == nil {
+			batch.Delete(kv.KV[i].Key)
+		} else {
+			batch.Set(kv.KV[i].Key, kv.KV[i].Value)
+		}
+	}
+	dbm.MustWrite(batch)
+}
+
+func (bs *BlockStore) multiGetBody(blockheader *types.Header, indexName string, prefix []byte, primaryKey []byte) (*types.BlockBody, error) {
+	cfg := bs.client.GetConfig()
+	chainCfg := cfg.GetModuleConfig().BlockChain
+
+	blockbody, err := getBodyByIndex(bs.db, indexName, prefix, primaryKey)
+	if blockbody == nil || err != nil {
+		if blockheader.GetHeight() > bs.Height()-MaxRollBlockNum-(chainCfg.ChunkblockNum)*int64(DelRollbackChunkNum) {
+			// 该高度范围应该保存在本地
+			return nil, types.ErrHashNotExist
+		}
+		if !chainCfg.DisableShard && chainCfg.EnableFetchP2pstore {
+			bodys, err := bs.getBodyFromP2Pstore(blockheader.Hash, blockheader.Height, blockheader.Height)
+			if bodys == nil || len(bodys.Items) == 0 || err != nil {
+				if err != dbm.ErrNotFoundInDb {
+					storeLog.Error("multiGetBody:getBodyFromP2Pstore", "indexName", indexName, "prefix", prefix,
+						"primaryKey", primaryKey, "err", err, "hash", common.ToHex(blockheader.Hash))
+				}
+				return nil, types.ErrHashNotExist
+			}
+			blockbody = bodys.Items[0]
+			return blockbody, nil
+		}
+
+		if err != dbm.ErrNotFoundInDb {
+			storeLog.Error("multiGetBody:getBodyByIndex", "indexName", indexName, "prefix", prefix, "primaryKey", primaryKey, "err", err)
+		}
+		return nil, types.ErrHashNotExist
+	}
+	return blockbody, nil
+}
+
+func (bs *BlockStore) getBodyFromP2Pstore(hash []byte, start, end int64) (*types.BlockBodys, error) {
+	stime := time.Now()
+	defer func() {
+		etime := time.Now()
+		storeLog.Info("getBodyFromP2Pstore", "start", start, "end", end, "cost time", etime.Sub(stime))
+	}()
+	//value, err := bs.db.Get(calcBlockHashToChunkHash(hash))
+	//if value == nil || err != nil {
+	//	if err != dbm.ErrNotFoundInDb {
+	//		storeLog.Error("getBodyFromP2Pstore:calcBlockHashToChunkHash", "hash", common.ToHex(hash), "chunkhash", common.ToHex(value), "err", err)
+	//	}
+	//	return nil, types.ErrHashNotExist
+	//}
+	cfg := bs.client.GetConfig()
+	chainCfg := cfg.GetModuleConfig().BlockChain
+	chunkNum := start / chainCfg.ChunkblockNum
+	value, err := bs.db.Get(calcChunkNumToHash(chunkNum))
+	if err != nil {
+		return nil, types.ErrHashNotExist
+	}
+	var chunkInfo types.ChunkInfo
+	if err := types.Decode(value, &chunkInfo); err != nil {
+		return nil, types.ErrDecode
+	}
+
+	if bs.client == nil {
+		storeLog.Error("getBodyFromP2Pstore: chain client not bind message queue.")
+		return nil, types.ErrClientNotBindQueue
+	}
+	req := &types.ChunkInfoMsg{
+		ChunkHash: chunkInfo.ChunkHash,
+		Start:     start,
+		End:       end,
+	}
+	msg := bs.client.NewMessage("p2p", types.EventGetChunkBlockBody, req)
+	err = bs.client.Send(msg, true)
+	if err != nil {
+		storeLog.Error("EventGetChunkBlockBody", "chunk hash", common.ToHex(value), "hash", common.ToHex(hash), "err", err)
+		return nil, err
+	}
+	// 网络查询阻塞最长等待3分钟
+	resp, err := bs.client.WaitTimeout(msg, time.Minute*3)
+	if err != nil {
+		storeLog.Error("EventGetChunkBlockBody", "client.Wait err:", err)
+		return nil, err
+	}
+	bodys, ok := resp.Data.(*types.BlockBodys)
+	if !ok {
+		err = types.ErrNotFound
+		storeLog.Error("EventGetChunkBlockBody", "client.Wait err:", err)
+		return nil, err
+	}
+	return bodys, nil
+}
+
+func (bs *BlockStore) getCurChunkNum(prefix []byte) int64 {
+	it := bs.db.Iterator(prefix, nil, true)
+	defer it.Close()
+	height := int64(-1)
+	var err error
+	if it.Rewind() && it.Valid() {
+		height, err = strconv.ParseInt(string(bytes.TrimPrefix(it.Key(), prefix)), 10, 64)
+		if err != nil {
+			return -1
+		}
+	}
+	return height
+}
+
+func (bs *BlockStore) deleteRecvChunkHash(num int64) error {
+	prefix := RecvChunkNumToHash
+	it := bs.db.Iterator(prefix, nil, true)
+	defer it.Close()
+	batch := bs.db.NewBatch(false)
+	defer dbm.MustWrite(batch)
+	for it.Rewind(); it.Valid(); it.Next() {
+		chunkNum, err := strconv.ParseInt(string(bytes.TrimPrefix(it.Key(), prefix)), 10, 64)
+		if err != nil || chunkNum < num {
+			return err
+		}
+		batch.Delete(it.Key())
+	}
+	return nil
+}
+
+func (bs *BlockStore) getRecvChunkHash(chunkNum int64) ([]byte, error) {
+	value, err := bs.GetKey(calcRecvChunkNumToHash(chunkNum))
+	if err != nil {
+		return nil, err
+	}
+	var chunk types.ChunkInfo
+	err = types.Decode(value, &chunk)
+	if err != nil {
+		storeLog.Error("getRecvChunkHash", "chunkNum", chunkNum, "decode err:", err)
+		return nil, err
+	}
+	return chunk.ChunkHash, err
+}
+
+//GetMaxSerialChunkNum get max serial chunk num
+func (bs *BlockStore) GetMaxSerialChunkNum() int64 {
+	value, err := bs.db.Get(MaxSerialChunkNum)
+	if err != nil {
+		return -1
+	}
+	chunkNum := &types.Int64{}
+	err = types.Decode(value, chunkNum)
+	if err != nil {
+		return -1
+	}
+	return chunkNum.Data
+}
+
+//SetMaxSerialChunkNum set max serial chunk num
+func (bs *BlockStore) SetMaxSerialChunkNum(chunkNum int64) error {
+	data := &types.Int64{
+		Data: chunkNum,
+	}
+	return bs.db.Set(MaxSerialChunkNum, types.Encode(data))
+}
+
+// GetMaxDeletedChunkNum gets max chunkNum of deleted chunks.
+func (bs *BlockStore) GetMaxDeletedChunkNum() int64 {
+	value, err := bs.db.Get(MaxDeletedChunkNum)
+	if err != nil {
+		return -1
+	}
+	chunkNum := &types.Int64{}
+	err = types.Decode(value, chunkNum)
+	if err != nil {
+		return -1
+	}
+	return chunkNum.Data
+}
+
+// SetMaxDeletedChunkNum sets max chunkNum of deleted chunks.
+func (bs *BlockStore) SetMaxDeletedChunkNum(chunkNum int64) error {
+	data := &types.Int64{
+		Data: chunkNum,
+	}
+	return bs.db.Set(MaxDeletedChunkNum, types.Encode(data))
+}
+
+// GetActiveBlock :从缓存的活跃区块中获取对应高度的区块
+func (bs *BlockStore) GetActiveBlock(hash string) (*types.BlockDetail, bool) {
+	block := bs.activeBlocks.Get(hash)
+	if block != nil {
+		return block.(*types.BlockDetail), true
+	}
+	return nil, false
+}
+
+// AddActiveBlock :将区块缓存到活跃区块中
+func (bs *BlockStore) AddActiveBlock(hash string, block *types.BlockDetail) bool {
+	return bs.activeBlocks.Add(hash, block, block.Size())
+}
+
+// RemoveActiveBlock :从缓存的活跃区块中删除对应的区块
+func (bs *BlockStore) RemoveActiveBlock(hash string) bool {
+	_, ok := bs.activeBlocks.Remove(hash)
+	return ok
 }
