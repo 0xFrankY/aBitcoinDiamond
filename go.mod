@@ -1,4 +1,4 @@
-module github.com/aBitcoinDiamond
+module github.com/0xFrankY/aBitcoinDiamond
 
 go 1.17
 
